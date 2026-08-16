@@ -33,13 +33,7 @@ import {
   readCronToolAgentId,
   resolveCronToolCallerScope,
 } from "./cron-tool-caller-scope.js";
-import {
-  canonicalizeCronToolObject,
-  hasCronCreateSignal,
-  isEmptyRecoveredCronPatch,
-  recoverCronObjectFromFlatParams,
-  stripCronCreateNullClears,
-} from "./cron-tool-canonicalize.js";
+import { canonicalizeCronToolObject, stripCronCreateNullClears } from "./cron-tool-canonicalize.js";
 import {
   buildReminderContextLines,
   REMINDER_CONTEXT_MARKER,
@@ -50,6 +44,7 @@ import {
   capCronJobToolsAllowOnCreate,
   cronCreateRequiresCreatorAuthority,
 } from "./cron-tool-creator-cap.js";
+import { prepareCronToolArguments } from "./cron-tool-prepare.js";
 import {
   assertCronPacingInput,
   createCronToolSchema,
@@ -71,10 +66,6 @@ export {
   captureFinalEffectiveCronCreatorToolAllowlist,
   replaceWithEffectiveCronCreatorToolAllowlist,
 } from "./cron-tool-creator-cap.js";
-
-function isMissingOrEmptyObject(value: unknown): boolean {
-  return !value || (isRecord(value) && Object.keys(value).length === 0);
-}
 
 function readCronJobIdParam(params: Record<string, unknown>) {
   return readToolStringParam(params, "jobId") ?? readToolStringParam(params, "id");
@@ -187,6 +178,12 @@ ACTIONS: status | list [includeDisabled,limit?,offset?] (use nextOffset for the 
 
 ADD: ${addFields}. Required: schedule+payload.
 
+For ordinary add/update calls, prefer these flat fields when nested objects are unreliable:
+{ "action":"add", "name":"...", "at":"<ISO-8601>"|"everyMs":<ms>|"expr":"<cron>", "tz":"<optional-IANA>", "message":"<agentTurn prompt>"|"text":"<systemEvent text>", "toolsAllow":["read"], "sessionTarget":"main|isolated|current|session:<id>", "enabled":true }
+Exactly one schedule field: at, everyMs, or expr. message implies agentTurn; text implies systemEvent.
+Use nested job for model routing, scripts, pacing, triggers, streams, delivery, and other advanced settings. Top-level mode is wake-only.
+When both forms are sent, the nested job takes precedence over flat fields.
+
 SCHEDULE:
 - {kind:"at",at:"ISO-8601"} one-shot; no tz=UTC; auto-deletes after run.
 - {kind:"every",everyMs}.
@@ -229,9 +226,10 @@ export function createCronTool(opts?: CronToolOptions, deps?: CronToolDeps): Any
     displaySummary: CRON_TOOL_DISPLAY_SUMMARY,
     description: buildCronToolDescription({ triggersEnabled }),
     parameters: createCronToolSchema({ triggersEnabled }),
+    prepareArguments: prepareCronToolArguments,
     execute: async (_toolCallId, args, operationSignal) => {
       operationSignal?.throwIfAborted();
-      const params = args as Record<string, unknown>;
+      const params = prepareCronToolArguments(args);
       const action = readToolStringParam(params, "action", { required: true });
       assertCronSelfRemoveScope(opts, action, params);
       const parsedGatewayOpts = readGatewayCallOptions(params);
@@ -332,21 +330,6 @@ export function createCronTool(opts?: CronToolOptions, deps?: CronToolDeps): Any
             );
           }
           case "add": {
-            // Flat-params recovery: non-frontier models (e.g. Grok) sometimes flatten
-            // job properties to the top level alongside `action` instead of nesting
-            // them inside `job`. When `params.job` is missing or empty, reconstruct
-            // a synthetic job object from any recognised top-level job fields.
-            // See: https://github.com/openclaw/openclaw/issues/11310
-            if (isMissingOrEmptyObject(params.job)) {
-              const synthetic = recoverCronObjectFromFlatParams(params);
-              // Only use the synthetic job if at least one meaningful field is present
-              // (schedule, payload, message, or text are the minimum signals that the
-              // LLM intended to create a job).
-              if (synthetic.found && hasCronCreateSignal(synthetic.value)) {
-                params.job = synthetic.value;
-              }
-            }
-
             if (!params.job || typeof params.job !== "object") {
               throw new Error("job required");
             }
@@ -523,16 +506,6 @@ export function createCronTool(opts?: CronToolOptions, deps?: CronToolDeps): Any
               throw new Error("jobId required (id accepted for backward compatibility)");
             }
 
-            // Flat-params recovery for update patches
-            let recoveredFlatPatch = false;
-            if (isMissingOrEmptyObject(params.job)) {
-              const synthetic = recoverCronObjectFromFlatParams(params);
-              if (synthetic.found) {
-                params.job = synthetic.value;
-                recoveredFlatPatch = true;
-              }
-            }
-
             if (!params.job || typeof params.job !== "object") {
               throw new Error("job required");
             }
@@ -549,9 +522,6 @@ export function createCronTool(opts?: CronToolOptions, deps?: CronToolDeps): Any
               throw new Error("displayName must be a non-empty string or null");
             }
             const patch = normalizeCronJobPatch(canonicalPatch) ?? canonicalPatch;
-            if (recoveredFlatPatch && isEmptyRecoveredCronPatch(patch)) {
-              throw new Error("job required");
-            }
             if (callerScope && "agentId" in patch) {
               throw new Error("automation patch agentId cannot be changed by the automations tool");
             }
