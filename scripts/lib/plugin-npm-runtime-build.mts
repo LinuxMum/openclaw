@@ -4,18 +4,20 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { isTypeScriptPackageEntry } from "../../src/plugins/package-entrypoints.ts";
 import {
+  PLUGIN_ACTIVITY_ICON_PATH,
+  PLUGIN_TOOL_ACTIVITY_ICON_DIR,
+  PORTABLE_PLUGIN_ICON_PATH,
+} from "../../src/plugins/portable-icon-paths.ts";
+import {
   collectPluginSourceEntries,
   collectTopLevelPublicSurfaceEntries,
   pluginRuntimeExtension,
   resolvePluginRuntimeFormat,
 } from "./bundled-plugin-build-entries.mjs";
 import { assertRealOutputRoot } from "./output-root-guard.mjs";
-import {
-  listMissingPackageStaticAssetSources,
-  runPackageAssetBuild,
-} from "./plugin-npm-runtime-assets.mts";
+import { createPluginInventoryModuleRefsPlugin } from "./plugin-inventory-module-refs.mts";
+import { preparePackageRuntimeAssets } from "./plugin-npm-runtime-assets.mts";
 import { isRecord } from "./record-shared.mjs";
-import { copyStaticExtensionAssetsForPackage } from "./static-extension-assets.mts";
 
 const env = {
   NODE_ENV: "production",
@@ -27,7 +29,12 @@ export type PluginPackageJson = JsonRecord & {
   dependencies?: JsonRecord;
   openclaw?: {
     assetScripts?: { build?: unknown };
-    build?: { bundledDist?: unknown; openclawVersion?: unknown; runtimeFormat?: unknown };
+    build?: {
+      bundledDist?: unknown;
+      openclawVersion?: unknown;
+      runtimeFormat?: unknown;
+      workerEntries?: unknown;
+    };
     compat?: { pluginApi?: unknown };
     release?: {
       bundleRuntimeDependencies?: unknown;
@@ -63,7 +70,7 @@ function normalizePackageEntry(value: unknown) {
   return typeof value === "string" ? value.trim().replaceAll("\\", "/") : "";
 }
 
-function toPackageRuntimeEntry(entry: string, runtimeFormat: RuntimeBuildFormat = "esm") {
+export function toPackageRuntimeEntry(entry: string, runtimeFormat: RuntimeBuildFormat = "esm") {
   const normalized = normalizePackageEntry(entry).replace(/^\.\//u, "");
   return `./dist/${normalized.replace(/\.[^.]+$/u, pluginRuntimeExtension(runtimeFormat))}`;
 }
@@ -234,14 +241,19 @@ function resolvePluginNpmRuntimePackageFiles(plan: {
       : [],
   );
   merged.add("dist/**");
-  if (packageRelativePathExists(plan.packageDir, "openclaw.plugin.json")) {
-    merged.add("openclaw.plugin.json");
+  for (const file of [
+    "openclaw.plugin.json",
+    "README.md",
+    "SKILL.md",
+    PORTABLE_PLUGIN_ICON_PATH,
+    PLUGIN_ACTIVITY_ICON_PATH,
+  ]) {
+    if (packageRelativePathExists(plan.packageDir, file)) {
+      merged.add(file);
+    }
   }
-  if (packageRelativePathExists(plan.packageDir, "README.md")) {
-    merged.add("README.md");
-  }
-  if (packageRelativePathExists(plan.packageDir, "SKILL.md")) {
-    merged.add("SKILL.md");
+  if (packageRelativePathExists(plan.packageDir, PLUGIN_TOOL_ACTIVITY_ICON_DIR)) {
+    merged.add(`${PLUGIN_TOOL_ACTIVITY_ICON_DIR}/*.svg`);
   }
   if (packageRelativePathExists(plan.packageDir, "skills")) {
     merged.add("skills/**");
@@ -311,9 +323,6 @@ export function resolvePluginNpmRuntimeBuildPlan(params: PluginNpmRuntimeBuildPa
   const repoRoot = path.resolve(params.repoRoot ?? ".");
   const packageDir = resolvePackageDir(repoRoot, params.packageDir);
   const packageJsonPath = path.join(packageDir, "package.json");
-  if (!fs.existsSync(packageJsonPath)) {
-    return null;
-  }
   const packageJson = readJsonFile(packageJsonPath);
   const rootPackageJsonPath = path.join(repoRoot, "package.json");
   const rootPackageJson = fs.existsSync(rootPackageJsonPath)
@@ -326,7 +335,11 @@ export function resolvePluginNpmRuntimeBuildPlan(params: PluginNpmRuntimeBuildPa
   }
 
   const runtimeFormat = resolvePluginRuntimeFormat(packageJson);
-  const packageEntries = collectPluginSourceEntries(packageJson).map(normalizePackageEntry);
+  const manifestPath = path.join(packageDir, "openclaw.plugin.json");
+  const manifest = fs.existsSync(manifestPath) ? readJsonFile(manifestPath) : {};
+  const packageEntries = collectPluginSourceEntries(packageJson, manifest).map(
+    normalizePackageEntry,
+  );
   const requiresRuntimeBuild = packageEntries.some(isTypeScriptPackageEntry);
   if (!requiresRuntimeBuild) {
     return null;
@@ -399,6 +412,14 @@ export async function buildPluginNpmRuntime(params: PluginNpmRuntimeBuildParams)
       neverBundle: createNeverBundleDependencyMatcher(plan.packageJson),
     },
     entry: plan.entry,
+    plugins: [createPluginInventoryModuleRefsPlugin(plan.packageDir)],
+    outputOptions: {
+      chunkFileNames: `.setup/[name]-[hash]${plan.runtimeFormat === "cjs" ? ".cjs" : ".mjs"}`,
+      entryFileNames: (chunk) =>
+        Object.hasOwn(plan.entry, chunk.name)
+          ? `[name]${pluginRuntimeExtension(plan.runtimeFormat)}`
+          : `.setup/[name]-[hash]${plan.runtimeFormat === "cjs" ? ".cjs" : ".mjs"}`,
+    },
     env,
     fixedExtension: plan.runtimeFormat === "cjs",
     format: plan.runtimeFormat,
@@ -413,21 +434,9 @@ export async function buildPluginNpmRuntime(params: PluginNpmRuntimeBuildParams)
     );
   }
   rewriteCommonJsRuntimeSpecifiers(plan);
-  const assetBuildCommand = runPackageAssetBuild(plan);
-  const missingStaticAssets = listMissingPackageStaticAssetSources(plan);
-  if (missingStaticAssets.length > 0) {
-    throw new Error(
-      `${plan.pluginDir} missing static asset source(s): ${missingStaticAssets.join(", ")}`,
-    );
-  }
-  const copiedStaticAssets = copyStaticExtensionAssetsForPackage({
-    rootDir: plan.repoRoot,
-    pluginDir: plan.pluginDir,
-  });
   return {
     ...plan,
-    assetBuildCommand,
-    copiedStaticAssets,
+    ...preparePackageRuntimeAssets(plan),
   };
 }
 
@@ -473,7 +482,7 @@ async function preparePluginNativeImport(params: PluginNpmRuntimeBuildParams) {
   const dependency = resolveOpenClawHostDependency(manifest.value);
   if (!dependency) {
     throw new Error(
-      `${params.packageDir} does not declare openclaw in peerDependencies or dependencies; no host link to prepare.`,
+      `${params.packageDir} does not declare openclaw in peerDependencies, optionalDependencies, or dependencies; no host link to prepare.`,
     );
   }
   if (
@@ -534,7 +543,7 @@ function readPackageDirArg(argv: string[]) {
     throw new Error(usage());
   }
   const extraArg = args[1];
-  if (extraArg) {
+  if (args.length > 1) {
     throw new Error(`unexpected plugin npm runtime build argument: ${extraArg}`);
   }
   return prepareIndex === -1 ? { packageDir } : { packageDir, prepareNativeImport: true };

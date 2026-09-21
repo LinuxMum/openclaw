@@ -15,6 +15,7 @@ import {
   setRuntimeConfigSnapshot,
 } from "../../../config/runtime-snapshot.js";
 import { rawDataToString } from "../../../infra/ws.js";
+import { GatewayConnectionWork } from "../../server-connection-work.js";
 import type { GatewayRequestContext } from "../../server-methods/types.js";
 import { GatewayNodeLifecycleDispatchTracker } from "./node-lifecycle-dispatch.js";
 
@@ -90,6 +91,7 @@ vi.mock("../../../version.js", async (importOriginal) => {
   return { ...actual, resolveRuntimeServiceBuildId: resolveRuntimeServiceBuildIdMock };
 });
 
+import { createDeferred } from "../../../../test/helpers/promise.js";
 import { attachGatewayWsMessageHandler } from "./message-handler.js";
 
 // A stale Control UI browser still owns a device identity; the build check is
@@ -169,6 +171,7 @@ describe("Control UI build admission over WebSocket", () => {
     },
   ])("rejects a $name before registration or RPC dispatch", async (testCase) => {
     const { clientBuildId } = testCase;
+    const connectionWork = new GatewayConnectionWork();
     const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
     await withDeadline(
       new Promise<void>((resolve) => {
@@ -184,10 +187,8 @@ describe("Control UI build admission over WebSocket", () => {
     let connectedClient: unknown = null;
     // Hold the injected close until the post-rejection frame reaches the handler;
     // otherwise socket timing can make the no-RPC assertion vacuous.
-    let releasePostRejectionFrame = () => {};
-    const postRejectionFrameObserved = new Promise<void>((resolve) => {
-      releasePostRejectionFrame = resolve;
-    });
+    const { promise: postRejectionFrameObserved, resolve: releasePostRejectionFrame } =
+      createDeferred();
     let closeRequested = false;
 
     wss.on("connection", (socket, request) => {
@@ -197,6 +198,8 @@ describe("Control UI build admission over WebSocket", () => {
       };
       attachGatewayWsMessageHandler({
         socket,
+        prepareAuthenticatedReceive: () => ({ ok: true, value: vi.fn() }),
+        connectionWork,
         upgradeReq: request as IncomingMessage,
         ingressAttribution: {
           kind: "direct-local",
@@ -348,13 +351,22 @@ describe("Control UI build admission over WebSocket", () => {
       });
       expect(handleGatewayRequestMock).not.toHaveBeenCalled();
     } finally {
+      releasePostRejectionFrame();
       ws.terminate();
-      await withDeadline(
-        new Promise<void>((resolve) => {
-          wss.close(() => resolve());
-        }),
-        "cleanup",
-      );
+      for (const socket of wss.clients) {
+        socket.terminate();
+      }
+      connectionWork.beginClose();
+      try {
+        await withDeadline(
+          new Promise<void>((resolve) => {
+            wss.close(() => resolve());
+          }),
+          "cleanup",
+        );
+      } finally {
+        await connectionWork.drain();
+      }
     }
   });
 });

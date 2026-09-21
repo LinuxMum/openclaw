@@ -5,6 +5,7 @@ import type { PluginRuntime } from "openclaw/plugin-sdk/channel-core";
 import { logTypingFailure } from "openclaw/plugin-sdk/channel-feedback";
 import {
   createChannelInboundDebouncer,
+  resolveInboundDebounceMs,
   formatInboundMediaUnavailableText,
   resolveEnvelopeFormatOptions,
   runChannelInboundEvent,
@@ -36,7 +37,11 @@ import { isInboundPathAllowed, kindFromMime } from "openclaw/plugin-sdk/media-ru
 import { DEFAULT_GROUP_HISTORY_LIMIT, type HistoryEntry } from "openclaw/plugin-sdk/reply-history";
 import { resolveTextChunkLimit, type GetReplyOptions } from "openclaw/plugin-sdk/reply-runtime";
 import { resolveInboundLastRouteSessionKey } from "openclaw/plugin-sdk/routing";
-import { getRuntimeConfig, type OpenClawConfig } from "openclaw/plugin-sdk/runtime-config-snapshot";
+import {
+  createRuntimeConfigReader,
+  getRuntimeConfig,
+  type OpenClawConfig,
+} from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { danger, logVerbose, shouldLogVerbose, warn } from "openclaw/plugin-sdk/runtime-env";
 import {
   resolveOpenProviderRuntimeGroupPolicy,
@@ -50,7 +55,6 @@ import {
   resolveSendPolicy,
   resolveStorePath,
 } from "openclaw/plugin-sdk/session-store-runtime";
-import { openNodeSqliteDatabase } from "openclaw/plugin-sdk/sqlite-runtime";
 import { normalizeStringEntries } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { sliceUtf16Safe, truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { waitForTransportReady } from "openclaw/plugin-sdk/transport-ready-runtime";
@@ -62,6 +66,7 @@ import { pollPendingIMessageApprovalReactions } from "../approval-reaction-polle
 import { maybeResolveIMessageApprovalReaction } from "../approval-reactions.js";
 import { buildIMessageApprovalConversationKeyForInbound } from "../approval-target-keys.js";
 import { resolveIMessageDirectChatService } from "../chat-context.js";
+import { resolveIMessageStartupRowidWatermark } from "../chat-db.js";
 import { markIMessageChatRead, sendIMessageTyping } from "../chat.js";
 import { resolveIMessageChatDbLookupPath } from "../cli-path.js";
 import { createIMessageRpcClient, type IMessageRpcClient } from "../client.js";
@@ -70,11 +75,7 @@ import {
   resolveIMessageAttachmentRoots,
   resolveIMessageRemoteAttachmentRoots,
 } from "../media-contract.js";
-import {
-  getCachedIMessagePrivateApiStatus,
-  imessageRpcSupportsMethod,
-  probeIMessage,
-} from "../probe.js";
+import { imessageRpcSupportsMethod, probeIMessage, probeIMessagePrivateApi } from "../probe.js";
 import {
   hasIMessageQuestionReactionTarget,
   maybeResolveIMessageQuestionReaction,
@@ -215,30 +216,6 @@ function resolveIMessageWatchSourceDbPath(params: {
   return resolveIMessageChatDbLookupPath(params);
 }
 
-async function resolveIMessageStartupRowidWatermark(dbPath: string): Promise<number | null> {
-  let database:
-    | {
-        close: () => void;
-        prepare: (sql: string) => { get: () => unknown };
-      }
-    | undefined;
-  try {
-    database = openNodeSqliteDatabase(dbPath, { readOnly: true });
-    const row = database.prepare("SELECT MAX(ROWID) AS maxRowid FROM message").get() as
-      | { maxRowid?: unknown }
-      | undefined;
-    if (typeof row?.maxRowid === "number" && Number.isFinite(row.maxRowid)) {
-      return row.maxRowid;
-    }
-    return row?.maxRowid === null ? 0 : null;
-  } catch (err) {
-    logVerbose(`imessage: startup rowid watermark unavailable for db=${dbPath}: ${String(err)}`);
-    return null;
-  } finally {
-    database?.close();
-  }
-}
-
 const warnIfImsgUpgradeNeeded = (() => {
   let fired = false;
   return {
@@ -358,6 +335,7 @@ async function waitForWatchSubscribeRetryDelay(params: {
 export async function monitorIMessageProvider(opts: MonitorIMessageOpts = {}): Promise<void> {
   const runtime = resolveRuntime(opts);
   const cfg = opts.config ?? getRuntimeConfig();
+  const readConfig = createRuntimeConfigReader(cfg);
   const accountInfo = resolveIMessageAccount({
     cfg,
     accountId: opts.accountId,
@@ -467,7 +445,7 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts = {}): P
     dbPath,
     remoteHost,
   });
-  const recoveryCursorRowid = loadIMessageRecoveryCursor(
+  const recoveryCursorRowid = await loadIMessageRecoveryCursor(
     accountInfo.accountId,
     recoveryCursorDbIdentity,
     { migrateLegacyCatchup: !catchupCfg.enabled, watermarkRowid: recoveryBoundaryRowid },
@@ -495,7 +473,7 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts = {}): P
     return min;
   }
 
-  function advanceRecoveryCursorAfterDurableEnqueue(rowid: number): void {
+  async function advanceRecoveryCursorAfterDurableEnqueue(rowid: number): Promise<void> {
     if (catchupCfg.enabled) {
       return;
     }
@@ -507,7 +485,7 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts = {}): P
       holdFloor !== null && maxDurableRowid >= holdFloor ? holdFloor - 1 : maxDurableRowid;
 
     if (nextCursorRowid >= 0 && nextCursorRowid > latestAdvancedRecoveryCursorRowid) {
-      advanceIMessageRecoveryCursor(
+      await advanceIMessageRecoveryCursor(
         accountInfo.accountId,
         recoveryCursorDbIdentity,
         nextCursorRowid,
@@ -534,6 +512,7 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts = {}): P
   }>({
     cfg,
     channel: "imessage",
+    resolveDebounceMs: () => resolveInboundDebounceMs({ cfg: readConfig(), channel: "imessage" }),
     buildKey: (entry) => {
       const msg = entry.message;
       const sender = msg.sender?.trim();
@@ -930,10 +909,14 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts = {}): P
     const storePath = resolveStorePath(cfg.session?.store, {
       agentId: decision.route.agentId,
     });
-    const privateApiStatus = getCachedIMessagePrivateApiStatus(cliPath);
+    // A bridge stall invalidates the process-wide capability snapshot before
+    // recovery re-injects the helper. Re-resolve a missing/expired snapshot so
+    // later inbound turns can resume typing and read receipts without waiting
+    // for an unrelated action or a gateway restart to populate the cache.
+    const privateApiStatus = await probeIMessagePrivateApi(cliPath, probeTimeoutMs);
     const supportsTyping = imessageRpcSupportsMethod(privateApiStatus, "typing");
     const supportsRead = imessageRpcSupportsMethod(privateApiStatus, "read");
-    if (privateApiStatus?.available === true) {
+    if (privateApiStatus.available) {
       // Surface a single warning per restart when the bridge is up but we
       // had to gate off typing/read because the imsg build pre-dates the
       // capability list. Otherwise the user sees no typing bubble / no
@@ -1215,12 +1198,13 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts = {}): P
     const directToolTypingOptions = shouldUseDirectToolTypingOptions
       ? ({
           // iMessage's native typing bubble is channel-owned UI, not a
-          // visible tool-progress message. The suppress flag is what lets
-          // dispatch forward this callback even when verbose progress is off;
-          // allowProgress covers message_tool_only source delivery. Keep this on
-          // the direct instant/default path even when older imsg builds do not
-          // report native typing support.
+          // visible tool-progress message. The lifecycle flag lets dispatch
+          // forward it while text progress is hidden; allowProgress covers
+          // message_tool_only source delivery. Keep this on the direct
+          // instant/default path even when older imsg builds do not report
+          // native typing support.
           suppressDefaultToolProgressMessages: true,
+          allowToolLifecycleWhenProgressHidden: true,
           allowProgressCallbacksWhenSourceDeliverySuppressed: true,
           onTypingController: (typing: IMessageTypingController) => {
             directTypingController = typing;
@@ -1480,7 +1464,7 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts = {}): P
       return { kind: "deferred" };
     },
     onDurableEnqueue: async (facts) => {
-      advanceRecoveryCursorAfterDurableEnqueue(facts.rowid);
+      await advanceRecoveryCursorAfterDurableEnqueue(facts.rowid);
       await maybeAdvanceLiveCatchupCursor({ id: facts.rowid, created_at: facts.createdAt });
     },
     onDurableEnqueueFailure: (rowid) => {

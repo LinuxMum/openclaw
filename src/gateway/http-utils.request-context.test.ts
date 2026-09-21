@@ -13,6 +13,7 @@ import {
   resolveTrustedHttpOperatorScopes,
 } from "./http-utils.js";
 import { CLI_DEFAULT_OPERATOR_SCOPES } from "./method-scopes.js";
+import { createExpectedBroadOperatorScopes } from "./scope-expectations.test-support.js";
 
 const sessionEntries = vi.hoisted(() => new Map<string, Record<string, unknown>>());
 
@@ -285,6 +286,12 @@ describe("resolveTrustedHttpOperatorScopes", () => {
         ),
       ).toEqual(roleScopes.length ? ["operator.read"] : []);
       expect(
+        resolveTrustedHttpOperatorScopes(
+          createReq({ "x-openclaw-scopes": "operator.admin" }),
+          requestAuth,
+        ),
+      ).toEqual(roleScopes);
+      expect(
         resolveTrustedHttpOperatorScopes(createReq({ "x-openclaw-scopes": "" }), requestAuth),
       ).toEqual([]);
     },
@@ -324,15 +331,7 @@ describe("resolveOpenAiCompatibleHttpOperatorScopes", () => {
       { authMethod: "token", trustDeclaredOperatorScopes: false },
     );
 
-    expect(scopes).toEqual([
-      "operator.admin",
-      "operator.read",
-      "operator.write",
-      "operator.approvals",
-      "operator.questions",
-      "operator.pairing",
-      "operator.talk.secrets",
-    ]);
+    expect(scopes).toEqual(createExpectedBroadOperatorScopes());
   });
 
   it("keeps declared scopes for trusted HTTP identity-bearing requests", () => {

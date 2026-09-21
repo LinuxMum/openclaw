@@ -36,6 +36,18 @@ const cleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const recoveryPromises = new Map<string, Promise<void>>();
 const recoveryRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const stagingLocks = new Map<string, Promise<void>>();
+let activeCleanup = 0;
+let activeRecovery = 0;
+
+export function hasBrowserProxyUploadWork(): boolean {
+  return (
+    activeCleanup > 0 ||
+    activeRecovery > 0 ||
+    cleanupTimers.size > 0 ||
+    recoveryRetryTimers.size > 0 ||
+    stagingLocks.size > 0
+  );
+}
 
 type PreparedBrowserProxyUploadRequest = {
   body: unknown;
@@ -164,7 +176,8 @@ function sanitizeUploadName(name: string): string {
     .replace(/[. ]+$/u, "");
   const portable = WINDOWS_RESERVED_NAME.test(cleaned) ? `_${cleaned}` : cleaned;
   const safe = portable && portable !== "." && portable !== ".." ? portable : "upload";
-  return truncateUtf8Prefix(safe, MAX_STAGED_NAME_BYTES) || "upload";
+  const truncated = truncateUtf8Prefix(safe, MAX_STAGED_NAME_BYTES).replace(/[. ]+$/u, "");
+  return (WINDOWS_RESERVED_NAME.test(truncated) ? `_${truncated}` : truncated) || "upload";
 }
 
 function decodedBase64Size(value: string): number {
@@ -196,6 +209,7 @@ function decodeUploadFile(file: BrowserProxyUploadFile, totalBytes: number): Buf
 }
 
 async function removeStagedUpload(directory: string): Promise<void> {
+  activeCleanup += 1;
   const timer = cleanupTimers.get(directory);
   if (timer) {
     clearTimeout(timer);
@@ -206,6 +220,8 @@ async function removeStagedUpload(directory: string): Promise<void> {
   } catch (error) {
     logger.warn(`browser proxy upload cleanup failed; retrying: ${String(error)}`);
     scheduleCleanup(directory, BROWSER_PROXY_UPLOAD_CLEANUP_RETRY_MS);
+  } finally {
+    activeCleanup -= 1;
   }
 }
 
@@ -358,12 +374,15 @@ async function runRecovery(params: {
   nowMs: number;
   limits: StagedUploadLimits;
 }): Promise<void> {
+  activeRecovery += 1;
   try {
     await recoverStagedUploads(params);
     clearRecoveryRetry(params.uploadDir);
   } catch (error) {
     logger.warn(`browser proxy upload recovery failed; retrying: ${String(error)}`);
     scheduleRecoveryRetry(params.uploadDir, params.retentionMs);
+  } finally {
+    activeRecovery -= 1;
   }
 }
 

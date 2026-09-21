@@ -3,13 +3,18 @@ import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { getPluginRuntimeGatewayRequestScope } from "openclaw/plugin-sdk/plugin-runtime";
 import { safeEqualSecret } from "openclaw/plugin-sdk/security-runtime";
-import { WebSocketServer, type WebSocket } from "ws";
+import {
+  rejectWebSocketUpgrade,
+  WebSocketServer,
+  type WebSocket,
+} from "openclaw/plugin-sdk/websocket-runtime";
 import { getRuntimeConfig } from "../../config/config.js";
 import {
   getBrowserControlState,
   startBrowserControlServiceFromConfig,
 } from "../../control-service.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { describeBrowserControlUnavailable } from "../../plugin-enabled.js";
 import { resolveProfile } from "../config.js";
 import { getProfileLifecycle } from "../server-context.lifecycle.js";
 import {
@@ -42,14 +47,6 @@ function getWss(): WebSocketServer {
   return wss;
 }
 
-function destroy(socket: Duplex, statusLine: string): void {
-  try {
-    socket.write(`HTTP/1.1 ${statusLine}\r\nConnection: close\r\n\r\n`);
-  } finally {
-    socket.destroy();
-  }
-}
-
 function requestedProfileName(resource: string, fallback: string): string {
   return new URL(resource, "http://127.0.0.1").searchParams.get("profile") ?? fallback;
 }
@@ -68,7 +65,7 @@ async function resolveGatewayRelay(resource: string) {
   if (!state) {
     state = await startBrowserControlServiceFromConfig();
     if (!state) {
-      throw new Error("Browser control is disabled");
+      throw new Error(await describeBrowserControlUnavailable());
     }
   }
   const profileName = requestedProfileName(
@@ -132,11 +129,11 @@ export async function handleGatewayExtensionUpgrade(
   const resource = parseExtensionRelayResource(req.url ?? "/", GATEWAY_EXTENSION_RELAY_PATH);
   if (!resource) {
     return (req.url ?? "/").split("?")[0] === GATEWAY_EXTENSION_RELAY_PATH
-      ? (destroy(socket, "400 Bad Request"), true)
+      ? (rejectWebSocketUpgrade(socket, { status: 400 }), true)
       : false;
   }
   if (!isAllowedExtensionOrigin(req)) {
-    destroy(socket, "403 Forbidden");
+    rejectWebSocketUpgrade(socket, { status: 403 });
     return true;
   }
 
@@ -150,7 +147,7 @@ export async function handleGatewayExtensionUpgrade(
   const token = readExtensionRelayToken();
   if (!token) {
     invalidateBrowserRelayAuthV2Authority();
-    destroy(socket, "401 Unauthorized");
+    rejectWebSocketUpgrade(socket, { status: 401 });
     return true;
   }
 
@@ -187,13 +184,13 @@ export async function handleGatewayExtensionUpgrade(
         },
       })
     ) {
-      destroy(socket, "400 Bad Request");
+      rejectWebSocketUpgrade(socket, { status: 400 });
     }
     return true;
   }
 
   if (protocols.includes(BROWSER_RELAY_EXTENSION_SUBPROTOCOL)) {
-    destroy(socket, "400 Bad Request");
+    rejectWebSocketUpgrade(socket, { status: 400 });
     return true;
   }
 
@@ -206,7 +203,7 @@ export async function handleGatewayExtensionUpgrade(
     legacyToken.length === 0 ||
     !safeEqualSecret(token, legacyToken)
   ) {
-    destroy(socket, "401 Unauthorized");
+    rejectWebSocketUpgrade(socket, { status: 401 });
     return true;
   }
 
@@ -215,7 +212,7 @@ export async function handleGatewayExtensionUpgrade(
     resolved = await resolveGatewayRelay(resource);
   } catch (err) {
     log.warn(`failed to start Browser control for legacy extension relay: ${String(err)}`);
-    destroy(socket, "503 Service Unavailable");
+    rejectWebSocketUpgrade(socket, { status: 503 });
     return true;
   }
   const authority = getBrowserRelayAuthV2Authority(token);

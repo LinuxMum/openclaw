@@ -13,6 +13,10 @@ export type VitestShardTimingSpec = {
   config: string;
   env?: NodeJS.ProcessEnv;
   includePatterns?: readonly string[] | null;
+  /** Exact chunk files for scheduling; does not configure execution filtering. */
+  timingTargets?: readonly string[];
+  /** Inherited filter identity, captured before its producer can remove the file. */
+  timingIncludePatterns?: readonly string[];
   watchMode?: boolean;
 };
 
@@ -39,6 +43,7 @@ type CompactSplitTimingGenerationSpec = {
 export type CompactSplitTimingKey = {
   expectedParts: number;
   generationKey: string;
+  parentShardName: string;
   part: number;
   selectorKey: string;
 };
@@ -59,6 +64,7 @@ export function parseCompactSplitTimingKey(value: string): CompactSplitTimingKey
   return {
     expectedParts,
     generationKey: `${match[1]}#generation-${match[2]}#parts-${expectedParts}`,
+    parentShardName: match[1]!.slice(0, match[1]!.lastIndexOf("#selector-")),
     part,
     selectorKey: match[1]!,
   };
@@ -93,18 +99,22 @@ export function createCompactSplitTimingGeneration(params: CompactSplitTimingGen
 }
 
 export function resolveShardTimingKey(spec: VitestShardTimingSpec): string {
-  if (!Array.isArray(spec.includePatterns) || spec.includePatterns.length === 0) {
+  const targets = spec.timingTargets ?? spec.includePatterns;
+  if (spec.timingIncludePatterns) {
+    const inherited = spec.timingIncludePatterns;
+    const chunk = targets ? `#targets-${targets.length}-${hashIncludePatterns(targets)}` : "";
+    return `${spec.config}#include-${inherited.length}-${hashIncludePatterns(inherited)}${chunk}`;
+  }
+  if (!Array.isArray(targets) || targets.length === 0) {
     return spec.config;
   }
 
   const shardName = sanitizeTimingLabel(spec.env?.[SHARD_NAME_ENV_KEY] ?? "");
-  if (shardName) {
+  if (shardName && !spec.timingTargets) {
     return `${spec.config}#${shardName}`;
   }
 
-  return `${spec.config}#include-${spec.includePatterns.length}-${hashIncludePatterns(
-    spec.includePatterns,
-  )}`;
+  return `${spec.config}#include-${targets.length}-${hashIncludePatterns(targets)}`;
 }
 
 // Advisory per-file cost hints (seconds) for stripe balancing, from file walls,
@@ -113,6 +123,10 @@ export function resolveShardTimingKey(spec: VitestShardTimingSpec): string {
 // files use the default, which mostly reflects the per-file module-graph
 // re-evaluation cost that dominates these serial suites.
 const STRIPE_FILE_SECONDS_HINTS = new Map<string, number>([
+  // Healthy two-worker Gateway proof: native-fork case spans were 24.8-29.9s
+  // and 37.1s. Keep conservative serial floors; group weights retain import overhead.
+  ["src/gateway/server.sessions.fixture-lifecycle.test.ts", 30],
+  ["src/gateway/server.startup-fixture-lifetime.test.ts", 42],
   // Serial file-boundary intervals from run 33364935118, including import/setup.
   // Runtime prerequisites are charged once per batch, separately from test work.
   ["test/e2e/qa-lab/runtime/gateway-support-export-runtime.test.ts", 6],

@@ -9,6 +9,54 @@ import Testing
 @Suite(.serialized)
 @MainActor
 struct StatusMenuSummariesTests {
+    @Test func `Automations shows the full enabled count beyond its preview`() async throws {
+        try await self.withFixture(cronJobCount: 201) { fixture in
+            _ = try await fixture.control.request(method: "health")
+            try #require(fixture.control.state == .connected)
+            let lease = try #require(await fixture.gateway.captureServerLease())
+            await fixture.cron.refreshJobs()
+            let jobs = fixture.cron.summary.jobs
+            _ = AppKitTestSupport.application
+            let item = NSMenuItem()
+            fixture.summaries.configureAutomations(item)
+            let preview = try #require(item.submenu).items.filter {
+                ($0.representedObject as? String)?.hasPrefix("cron.job.") == true
+            }
+            let row = try #require(item.view)
+            let window = NSWindow(contentRect: row.frame, styleMask: [.titled], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.contentView = row
+            defer {
+                window.orderOut(nil)
+                window.contentView = nil
+                window.close()
+                item.view = nil
+            }
+            window.orderFront(nil)
+            row.layoutSubtreeIfNeeded()
+            let elements = try await AppKitTestSupport.accessibilityElements(in: row)
+            let texts = elements.filter { $0.accessibilityRole?() == .staticText }.compactMap {
+                let value: Any? = $0.accessibilityValue?()
+                return value as? String
+            }
+            try #require(fixture.gateway.serverLeaseMatchesCurrentRoute(lease))
+            try #require(!jobs.isEmpty)
+            try #require(fixture.requests.value.contains { $0.method == "cron.list" && $0.owner == "A" })
+            try #require(preview.count == 8)
+            let text = try #require(texts.first { $0.hasPrefix("\(item.title), ") })
+            #expect(text == "\(item.title), 201")
+        }
+    }
+
+    @Test func `cost requests use the Mac time zone`() async throws {
+        try await self.withFixture { fixture in
+            try await fixture.populate()
+            let request = try #require(fixture.requests.value.first { $0.method == "usage.cost" })
+            #expect(request.dateMode == "specific")
+            #expect(request.timeZone == TimeZone.current.identifier)
+        }
+    }
+
     @Test
     func `retiring a Gateway invalidates the observed usage cache`() async throws {
         try await self.withFixture { fixture in
@@ -70,39 +118,61 @@ struct StatusMenuSummariesTests {
         }
     }
 
-    @Test(arguments: ["unchanged", "replacement", "closed"])
-    func `cold usage retry belongs to its visible Gateway`(_ transition: String) async throws {
-        try await self.withFixture { fixture in
-            fixture.coldUsage.setValue(true)
-            _ = try await fixture.control.request(method: "health")
-            fixture.summaries.refresh {}
-            try await fixture.waitUntil {
-                fixture.requests.value.contains { $0.method == "usage.status" }
-            }
-            if transition == "closed" {
-                fixture.summaries.menuDidClose()
-                try await Task.sleep(for: .milliseconds(5200))
-                #expect(fixture.requests.value.filter { $0.method == "usage.status" }.count == 1)
-                return
-            }
-            let owner = transition == "replacement" ? "B" : "A"
-            if transition == "replacement" {
-                fixture.revision.setValue(2)
-                _ = try await fixture.control.request(method: "health")
-                try await fixture.waitUntil {
-                    fixture.requests.value.contains { $0.method == "usage.status" && $0.owner == "B" }
-                }
-            }
-            // The client retry interval is five seconds; allow its one timer to fire.
-            try await fixture.waitUntil(timeout: .seconds(6)) {
-                fixture.summaries.usageSummary?.contains("Gateway \(owner)") == true
-            }
-            #expect(fixture.requests.value.filter { $0.method == "usage.status" && $0.owner == owner }.count == 2)
-            #expect(!fixture.summaries.isUsageStalled)
+    @Test func `cold usage retry belongs to its visible Gateway`() async throws {
+        try await self.withFixtures(count: 3) { fixtures in
+            // Each Gateway owns its retry timer; share only the isolated app state.
+            async let unchanged: Void = self.checkColdUsageRetry("unchanged", fixture: fixtures[0])
+            async let replacement: Void = self.checkColdUsageRetry("replacement", fixture: fixtures[1])
+            async let closed: Void = self.checkColdUsageRetry("closed", fixture: fixtures[2])
+            _ = try await (unchanged, replacement, closed)
         }
     }
 
-    private func withFixture(_ operation: (UsageGatewayFixture) async throws -> Void) async throws {
+    private func checkColdUsageRetry(_ transition: String, fixture: UsageGatewayFixture) async throws {
+        fixture.coldUsage.setValue(true)
+        _ = try await fixture.control.request(method: "health")
+        fixture.summaries.refresh {}
+        try await fixture.waitUntil {
+            fixture.requests.value.contains { $0.method == "usage.status" }
+        }
+        if transition == "closed" {
+            fixture.summaries.menuDidClose()
+            try await Task.sleep(for: .milliseconds(5200))
+            #expect(fixture.requests.value.filter { $0.method == "usage.status" }.count == 1, "closed Gateway")
+            return
+        }
+        let owner = transition == "replacement" ? "B" : "A"
+        if transition == "replacement" {
+            fixture.revision.setValue(2)
+            _ = try await fixture.control.request(method: "health")
+            try await fixture.waitUntil {
+                fixture.requests.value.contains { $0.method == "usage.status" && $0.owner == "B" }
+            }
+        }
+        // The client retry interval is five seconds; allow its one timer to fire.
+        try await fixture.waitUntil(timeout: .seconds(6)) {
+            fixture.summaries.usageSummary?.contains("Gateway \(owner)") == true
+        }
+        #expect(
+            fixture.requests.value.filter { $0.method == "usage.status" && $0.owner == owner }.count == 2,
+            "\(transition) Gateway")
+        #expect(!fixture.summaries.isUsageStalled, "\(transition) Gateway")
+    }
+
+    private func withFixture(
+        cronJobCount: Int = 0,
+        _ operation: (UsageGatewayFixture) async throws -> Void) async throws
+    {
+        try await self.withFixtures(count: 1, cronJobCount: cronJobCount) { fixtures in
+            try await operation(fixtures[0])
+        }
+    }
+
+    private func withFixtures(
+        count: Int,
+        cronJobCount: Int = 0,
+        _ operation: ([UsageGatewayFixture]) async throws -> Void) async throws
+    {
         try await TestIsolation.withIsolatedState {
             let state = AppStateStore.shared
             let previousMode = state.connectionMode
@@ -112,12 +182,16 @@ struct StatusMenuSummariesTests {
                 state.connectionMode = previousMode
                 state.profileAccentHex = previousAccent
             }
-            let fixture = UsageGatewayFixture()
+            let fixtures = (0..<count).map { _ in UsageGatewayFixture(cronJobCount: cronJobCount) }
             do {
-                try await operation(fixture)
-                await fixture.close()
+                try await operation(fixtures)
+                for fixture in fixtures {
+                    await fixture.close()
+                }
             } catch {
-                await fixture.close()
+                for fixture in fixtures {
+                    await fixture.close()
+                }
                 throw error
             }
         }
@@ -129,6 +203,8 @@ private final class UsageGatewayFixture {
     struct Request: Sendable {
         let owner: String
         let method: String
+        let dateMode: String?
+        let timeZone: String?
     }
 
     let revision = LockIsolated<UInt64>(1)
@@ -137,9 +213,10 @@ private final class UsageGatewayFixture {
     let session: GatewayTestWebSocketSession
     let gateway: GatewayConnection
     let control: ControlChannel
+    let cron: CronJobsStore
     let summaries: StatusMenuSummaries
 
-    init() {
+    init(cronJobCount: Int) {
         let revision = self.revision
         let requests = self.requests
         let coldUsage = self.coldUsage
@@ -156,7 +233,13 @@ private final class UsageGatewayFixture {
                 }
                 guard let frame = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let method = frame["method"] as? String else { return }
-                requests.withValue { $0.append(Request(owner: owner, method: method)) }
+                let requestParams = frame["params"] as? [String: Any]
+                let request = Request(
+                    owner: owner,
+                    method: method,
+                    dateMode: requestParams?["mode"] as? String,
+                    timeZone: requestParams?["timeZone"] as? String)
+                requests.withValue { $0.append(request) }
                 let payload: String
                 switch method {
                 case "usage.status":
@@ -180,6 +263,25 @@ private final class UsageGatewayFixture {
                     payload = #"{"updatedAt":1800000000000,"days":30,"daily":\#(daily),"totals":{\#(totals)}}"#
                 case "node.list":
                     payload = #"{"nodes":[]}"#
+                case "cron.list":
+                    let params = frame["params"] as? [String: Any]
+                    let limit = min(params?["limit"] as? Int ?? 200, 200)
+                    let count = min(cronJobCount, limit)
+                    // GRDB also overloads joined; these interpolations must remain JSON strings.
+                    let jobs = (0..<count).map { index -> String in
+                        let id = String(format: "job-%03d", index)
+                        return #"""
+                        {"id":"\#(id)","name":"Automation \#(index)","enabled":true,
+                        "createdAtMs":0,"updatedAtMs":0,"schedule":{"kind":"every","everyMs":1000},
+                        "sessionTarget":"main","wakeMode":"now",
+                        "payload":{"kind":"systemEvent","text":"fixture"},"state":{}}
+                        """#
+                    }.joined(separator: ",")
+                    let nextOffset = count < cronJobCount ? String(count) : "null"
+                    payload = #"""
+                    {"jobs":[\#(jobs)],"total":\#(cronJobCount),"offset":0,"limit":\#(limit),
+                    "snapshotRevision":"fixture","hasMore":\#(count < cronJobCount),"nextOffset":\#(nextOffset)}
+                    """#
                 default:
                     payload = #"{"ok":true}"#
                 }
@@ -198,10 +300,11 @@ private final class UsageGatewayFixture {
             currentEndpointRevision: { revision.value },
             sessionBox: WebSocketSessionBox(session: self.session))
         self.control = ControlChannel(gateway: self.gateway, endpointRevision: { revision.value })
+        self.cron = CronJobsStore(gateway: self.gateway, isPreview: true)
         self.summaries = StatusMenuSummaries(
             control: self.control,
             nodes: NodesStore(control: self.control, localNodeIDLoader: { _ in "synthetic-local-node" }),
-            cron: CronJobsStore(gateway: self.gateway, isPreview: true))
+            cron: self.cron)
     }
 
     var hasCostChart: Bool {

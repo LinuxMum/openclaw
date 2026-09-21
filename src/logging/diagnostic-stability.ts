@@ -190,10 +190,6 @@ function getDiagnosticStabilityState(): DiagnosticStabilityState {
   return globalStore["__openclawDiagnosticStabilityState"];
 }
 
-function copyMemory(memory: DiagnosticMemoryUsage): DiagnosticMemoryUsage {
-  return { ...memory };
-}
-
 function copyReasonCode(reason: unknown): string | undefined {
   if (typeof reason !== "string" || !SAFE_REASON_CODE.test(reason)) {
     return undefined;
@@ -249,7 +245,10 @@ function sanitizeDiagnosticEvent(event: DiagnosticEventPayload): DiagnosticStabi
 
   switch (event.type) {
     case "gateway.rpc":
-      // High-volume RPC timings are exporter-only and excluded by the subscription.
+    case "gateway.event_loop.sample":
+    case "diagnostic.gc":
+    case "diagnostic.child_process.spawn":
+      // Runtime measurements are exporter-only and excluded by the subscription.
       break;
     case "model.usage":
       record.channel = event.channel;
@@ -546,7 +545,7 @@ function sanitizeDiagnosticEvent(event: DiagnosticEventPayload): DiagnosticStabi
       record.responseBytes = event.responseStreamBytes;
       record.timeToFirstByteMs = event.timeToFirstByteMs;
       record.failureKind = event.failureKind;
-      record.memory = event.memory ? copyMemory(event.memory) : undefined;
+      record.memory = event.memory ? { ...event.memory } : undefined;
       assignReasonCode(record, event.errorCategory);
       break;
     case "log.record":
@@ -562,12 +561,12 @@ function sanitizeDiagnosticEvent(event: DiagnosticEventPayload): DiagnosticStabi
       assignReasonCode(record, event.reason ?? event.policy?.reason);
       break;
     case "diagnostic.memory.sample":
-      record.memory = copyMemory(event.memory);
+      record.memory = { ...event.memory };
       break;
     case "diagnostic.memory.pressure":
       record.level = event.level;
       assignReasonCode(record, event.reason);
-      record.memory = copyMemory(event.memory);
+      record.memory = { ...event.memory };
       record.thresholdBytes = event.thresholdBytes;
       record.rssGrowthBytes = event.rssGrowthBytes;
       record.windowMs = event.windowMs;
@@ -712,12 +711,12 @@ function summarizeRecords(
   let maxRssBytes: number | undefined;
   let maxHeapUsedBytes: number | undefined;
   let pressureCount = 0;
-  const payloadLarge = {
+  const payloadLarge: NonNullable<DiagnosticStabilitySnapshot["summary"]["payloadLarge"]> = {
     count: 0,
     rejected: 0,
     truncated: 0,
     chunked: 0,
-    bySurface: {} as Record<string, number>,
+    bySurface: {},
   };
 
   for (const record of records) {
@@ -864,7 +863,16 @@ export function startDiagnosticStabilityRecorder(): void {
       }
       appendRecord(sanitizeDiagnosticEvent(event));
     },
-    { exclude: ["log.record", "telemetry.exporter", "gateway.rpc"] },
+    {
+      exclude: [
+        "log.record",
+        "telemetry.exporter",
+        "gateway.rpc",
+        "gateway.event_loop.sample",
+        "diagnostic.gc",
+        "diagnostic.child_process.spawn",
+      ],
+    },
   );
 }
 

@@ -1,6 +1,6 @@
 import { isRecord as isPlainRecord } from "@openclaw/normalization-core/record-coerce";
 import JSON5 from "json5";
-import { rejectConfigNonFiniteNumbers } from "../config/io.read-helpers.js";
+import { rejectConfigNonFiniteNumbers } from "../config/value-tree.js";
 import { isBlockedObjectKey } from "../infra/prototype-keys.js";
 import {
   formatConcreteConfigPath,
@@ -518,25 +518,7 @@ export function unsetAtPath(root: Record<string, unknown>, path: PathSegment[]):
   if (last === undefined) {
     return { removed: false };
   }
-  let current: unknown = root;
-  for (const segment of path.slice(0, -1)) {
-    if (!current || typeof current !== "object") {
-      return { removed: false };
-    }
-    if (Array.isArray(current)) {
-      const index = parseIndexSegment(segment);
-      if (index === undefined || index >= current.length) {
-        return { removed: false };
-      }
-      current = current[index];
-      continue;
-    }
-    const record = current as Record<string, unknown>;
-    if (!hasOwnPathKey(record, segment)) {
-      return { removed: false };
-    }
-    current = record[segment];
-  }
+  const current = getAtPath(root, path.slice(0, -1)).value;
 
   if (Array.isArray(current)) {
     const index = parseIndexSegment(last);

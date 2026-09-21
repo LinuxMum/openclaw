@@ -186,6 +186,9 @@ describe("cross-OS manual gateway lane evidence", () => {
           if (outcome === "models-set") {
             throw new Error("injected models-set failure");
           }
+          if (_name === "fresh") {
+            writeFileSync(join(lane.stateDir, "openclaw.json"), "{}\n", "utf8");
+          }
         });
         mocks.runInstalledModelsSet.mockImplementation(() =>
           mocks.runModelsSet({ lane: { gatewayPort: port } }),
@@ -225,6 +228,158 @@ describe("cross-OS manual gateway lane evidence", () => {
       },
     );
   });
+
+  it.each(["retained", "missing", "expanded"] as const)(
+    "checks the authored nested path after fresh Gateway readiness: %s",
+    async (outcome) => {
+      arrangeSuccessfulLane();
+      const authored = {
+        plugins: {
+          enabled: true,
+          allow: ["openai"],
+          deny: ["retired"],
+          slots: { memory: "none" },
+          entries: { openai: { enabled: true, config: { apiKey: "fixture-secret" } } },
+        },
+        agents: { defaults: { model: "openai/gpt-5.6-luna" } },
+        gateway: { mode: "local" },
+      };
+      let configPath = "";
+      mocks.runModelsSet.mockImplementation(async ({ lane }) => {
+        configPath = join(lane.stateDir, "openclaw.json");
+        writeFileSync(configPath, JSON.stringify(authored), "utf8");
+      });
+      mocks.waitForGateway.mockImplementation(async () => {
+        const config = JSON.parse(readFileSync(configPath, "utf8"));
+        expect(config).toEqual({
+          ...authored,
+          plugins: {
+            ...authored.plugins,
+            entries: {
+              ...authored.plugins.entries,
+              wiki: { enabled: false, config: { store: { path: "~/.openclaw/wiki" } } },
+            },
+          },
+        });
+        if (outcome === "missing") {
+          delete config.plugins.entries.wiki.config.store.path;
+        } else if (outcome === "expanded") {
+          config.plugins.entries.wiki.config.store.path = "C:\\Users\\fixture\\.openclaw\\wiki";
+        }
+        writeFileSync(configPath, JSON.stringify(config), "utf8");
+      });
+
+      const result = runFreshLane(upgradeParams());
+      if (outcome === "retained") {
+        await expect(result).resolves.toMatchObject({
+          status: "pass",
+          phaseTimings: expect.arrayContaining([
+            expect.objectContaining({ name: "verify-nested-plugin-path", status: "pass" }),
+          ]),
+        });
+      } else {
+        await expect(result).rejects.toThrow(
+          "Fresh Gateway startup changed the authored nested plugin path.",
+        );
+      }
+      expect(mocks.startGateway).toHaveBeenCalledTimes(1);
+      expect(mocks.waitForGateway).toHaveBeenCalledTimes(1);
+      expect(mocks.runDashboardSmoke).toHaveBeenCalledTimes(outcome === "retained" ? 1 : 0);
+      expect(mocks.runAgentTurn).toHaveBeenCalledTimes(outcome === "retained" ? 1 : 0);
+      expect(mocks.stopGateway).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
+    ["pass", 15],
+    ["pass", 16],
+    ["update refused", 15],
+    ["skipped", 15],
+  ] as const)(
+    "proves stateful 9.2 packaged self-update without direct-install fallback: %s, publication %i",
+    async (outcome, publishedVersion) => {
+      arrangeSuccessfulLane();
+      mocks.readInstalledVersion.mockReset().mockReturnValue("2026.9.2");
+      mocks.readInstalledMetadata.mockReturnValue({
+        version: "2026.9.3",
+        commit: candidate.sourceSha,
+      });
+      mocks.stopGateway.mockImplementation(async (gateway) => {
+        if (gateway) {
+          gateway.child.exitCode = 0;
+        }
+      });
+      mocks.runCommand.mockImplementation(async (_command, args: string[]) => {
+        const schemaIndex = args.indexOf("schema");
+        if (schemaIndex !== -1) {
+          const contentVersion = Number(args[schemaIndex + 1]);
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              publishedVersion: contentVersion === 15 ? 15 : publishedVersion,
+              contentVersion,
+            }),
+            stderr: "",
+          };
+        }
+        if (args.includes("refusal") || args.includes("receipt")) {
+          throw new Error("obsolete external transition assertion");
+        }
+        return {
+          exitCode: 0,
+          stdout: args.includes("session-key") ? "agent:main:retained" : "{}",
+          stderr: "",
+        };
+      });
+      mocks.runOpenClaw.mockImplementation(async ({ args }: { args: string[] }) => {
+        if (args[0] === "update") {
+          return {
+            exitCode: outcome === "update refused" ? 1 : 0,
+            stdout: JSON.stringify({
+              status: outcome === "pass" ? "ok" : outcome === "skipped" ? "skipped" : "error",
+            }),
+            stderr: "",
+          };
+        }
+        return {
+          exitCode: 0,
+          stdout: args.includes("system-presence")
+            ? JSON.stringify([{ mode: "gateway", reason: "self", version: "2026.9.3" }])
+            : "{}",
+          stderr: "",
+        };
+      });
+      const result = await runUpgradeLane({
+        ...upgradeParams(),
+        build: { ...candidate, candidateVersion: "2026.9.3" },
+      });
+      if (outcome === "pass") {
+        expect(result).toMatchObject({
+          status: "pass",
+          method: "packaged-self-update",
+          selfUpdatePassed: true,
+          retainedSessionPassed: true,
+          persistedCandidateTurnPassed: true,
+          schemaAfterUpdate: { publishedVersion, contentVersion: 16 },
+          schemaAfterServing: { publishedVersion, contentVersion: 16 },
+        });
+        expect(mocks.startGateway).toHaveBeenCalledTimes(2);
+        expect(
+          mocks.runOpenClaw.mock.calls.filter(([call]) => call.args[0] === "agent"),
+        ).toHaveLength(2);
+      } else {
+        expect(result).toMatchObject({
+          status: "fail",
+          error: expect.stringContaining("packaged self-update"),
+        });
+      }
+      expect(
+        mocks.runOpenClaw.mock.calls.filter(([call]) => call.args[0] === "update"),
+      ).toHaveLength(1);
+      expect(mocks.runOpenClaw.mock.calls.some(([call]) => call.args[0] === "doctor")).toBe(false);
+      expect(mocks.installTarballPackage).not.toHaveBeenCalled();
+    },
+  );
 
   it("records bounded evidence when the supported Windows timeout fallback succeeds", async () => {
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");

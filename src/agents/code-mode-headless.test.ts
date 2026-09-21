@@ -94,6 +94,7 @@ describe("headless Code Mode", () => {
           const retained = new Uint8Array(16 * 1024 * 1024);
           retained[0] = 7;
           text("accepted inline");
+          await yield_control();
           await headless_snapshot_fresh({});
           return retained[0];`,
       }),
@@ -573,9 +574,7 @@ describe("headless Code Mode", () => {
     "preserves harmless $name in headless source validation",
     async ({ code, value, realHeadless }) => {
       if (!realHeadless) {
-        const ctx = createHeadlessCodeModeHarness();
-        const config = testing.resolveCodeModeHeadlessConfig(ctx);
-        await expect(prepareSource({ code, config })).resolves.toBe(code);
+        expect(prepareSource(code)).toBe(code);
         return;
       }
       const result = expectCompleted(
@@ -589,19 +588,6 @@ describe("headless Code Mode", () => {
       expect(result.toolCallCount).toBe(0);
     },
   );
-
-  it("executes module-shaped regular expressions in a TypeScript headless guest", async () => {
-    const result = expectCompleted(
-      await runCodeModeScriptHeadless({
-        ctx: createHeadlessCodeModeHarness(),
-        language: "typescript",
-        code: 'const value: number = 1; return /import.meta/.test("import.meta");',
-      }),
-    );
-
-    expect(result.value).toBe(true);
-    expect(result.toolCallCount).toBe(0);
-  });
 
   it.each([
     String.raw`return r\u0065quire('node:fs');`,
@@ -640,13 +626,12 @@ describe("headless Code Mode", () => {
   });
 
   it.each(["import('node:fs')", "require('node:fs')"])(
-    "rejects astral-shifted TypeScript module access in a headless guest: %s",
+    "rejects astral-shifted JavaScript module access in a headless guest: %s",
     async (moduleAccess) => {
       const result = expectFailed(
         await runCodeModeScriptHeadless({
           ctx: createHeadlessCodeModeHarness(),
-          language: "typescript",
-          code: `const padding: string = "${"😀".repeat(96)}"; return ${moduleAccess};`,
+          code: `const padding = "${"😀".repeat(96)}"; return ${moduleAccess};`,
         }),
       );
 

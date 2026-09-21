@@ -664,7 +664,7 @@ describe("session sharing policy", () => {
     ]);
   });
 
-  it("keeps agent scope for indirect run and approval authorization", async () => {
+  it("keeps agent scope for progress cards and indirect run and approval authorization", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
       await upsertSessionEntryCore(
         { agentId: "main", sessionKey: "global" },
@@ -699,11 +699,23 @@ describe("session sharing policy", () => {
       for (const [method, requestParams] of [
         ["sessions.abort", { runId: "run-1" }],
         ["exec.approval.resolve", { id: "approval-1" }],
+        ["progressCard.get", { sessionKey: "global", agentId: "work" }],
+        ["progressCard.put", { sessionKey: "global", agentId: "work" }],
       ] as const) {
         expect(
           resolveSessionMutationAuthorization({ client: outsider, method, requestParams, context })
             .error,
         ).toMatchObject({ details: { code: "SESSION_PARTICIPATION_REQUIRED" } });
+      }
+      for (const method of ["progressCard.get", "progressCard.put"]) {
+        expect(
+          resolveSessionMutationAuthorization({
+            client: outsider,
+            method,
+            requestParams: { sessionKey: "global", agentId: "main" },
+            context,
+          }).error,
+        ).toBeNull();
       }
       expect(
         resolveSessionMutationAuthorization({
@@ -769,28 +781,30 @@ describe("session sharing policy", () => {
           expectedSessionId: "session-suggestions",
         },
       );
-      const check = (user: string) =>
+      const check = (recipient: GatewayClient) =>
         canReceiveSessionEvent({
           cfg: {},
-          client: client({ user }) as never,
+          client: recipient,
           sessionKeys: [sessionKey],
           event: "session.suggestion",
           payload: { suggestion: { author: { id: "author" } } },
         });
 
-      expect(check("author")).toBe(true);
-      expect(check("member")).toBe(true);
-      expect(check("owner")).toBe(true);
-      expect(check("viewer")).toBe(false);
-      expect(
-        canReceiveSessionEvent({
-          cfg: {},
-          client: client({}) as never,
-          sessionKeys: [sessionKey],
-          event: "session.suggestion",
-          payload: { suggestion: { author: { id: "author" } } },
-        }),
-      ).toBe(false);
+      expect(check(client({ user: "author" }))).toBe(true);
+      expect(check(client({ user: "member" }))).toBe(true);
+      expect(check(client({ user: "owner" }))).toBe(true);
+      expect(check(client({ user: "viewer" }))).toBe(false);
+      expect(check(client({}))).toBe(false);
+
+      const recipient = client({ user: "author", displayName: "Viewer" });
+      recipient.internal = { operatorRoleActor: { kind: "operator", profileId: "viewer" } };
+      expect(check(recipient)).toBe(true);
+      recipient.authenticatedUserProfile!.profileId = "viewer";
+      expect(check(recipient)).toBe(false);
+      recipient.internal.operatorRoleActor = { kind: "operator", profileId: "author" };
+      expect(check(recipient)).toBe(false);
+      recipient.authenticatedUserProfile = undefined;
+      expect(check(recipient)).toBe(true);
     });
   });
 

@@ -3,7 +3,9 @@ import fs from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import path from "node:path";
 import { rawDataToString } from "@openclaw/gateway-client/websocket-data";
-import { WebSocket, WebSocketServer, type RawData } from "ws";
+import { expectDefined } from "@openclaw/normalization-core";
+import { WebSocket, type RawData } from "ws";
+import { WebSocketServer } from "../../packages/gateway-client/src/websocket.test-support.js";
 import {
   type WorkerLiveEventParams,
   WORKER_PROTOCOL_FEATURES,
@@ -12,11 +14,13 @@ import {
 import type { WorkerInferenceTerminalOutcome } from "../../packages/gateway-protocol/src/schema/worker-inference.js";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { createOperationalRunInstanceRef } from "../agents/admitted-run-context.js";
+import { createZeroUsageFixture } from "../agents/test-helpers/usage-fixtures.js";
 import {
   resolveSessionTranscriptRuntimeTarget,
   upsertSessionEntryCore,
 } from "../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { GatewayConnectionWork } from "../gateway/server-connection-work.js";
 import * as workerServer from "../gateway/server/ws-connection/worker-connection.js";
 import type { GatewayWsClient } from "../gateway/server/ws-types.js";
 import type { WorkerConnectionIdentity } from "../gateway/worker-environments/connection-identity.js";
@@ -37,6 +41,7 @@ import { createWorkerTranscriptCommitter } from "../gateway/worker-environments/
 import { onAgentRuntimeEvent } from "../infra/agent-events.js";
 import type { WorkerProvider, WorkerSshEndpoint } from "../plugins/types.js";
 import * as stateDb from "../state/openclaw-state-db.js";
+import { cleanupSessionStateForTest } from "../test-utils/session-state-cleanup.js";
 import { buildWorkerConnectParams, type WorkerLaunchDescriptor } from "./launch-descriptor.js";
 import { createWorkerConnection, type WorkerConnection } from "./worker-connection.js";
 import { WorkerFaultPlacementLifecycle } from "./worker-fault-placement-lifecycle.test-support.js";
@@ -89,14 +94,7 @@ export function doneMessage(text: string): WorkerDoneMessage {
     api: "openai-responses",
     provider: MODEL_REF.provider,
     model: MODEL_REF.model,
-    usage: {
-      input: 1,
-      output: 1,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 2,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    },
+    usage: { ...createZeroUsageFixture(), input: 1, output: 1, totalTokens: 2 },
     stopReason: "stop",
     timestamp: 1,
   };
@@ -177,12 +175,13 @@ export class ComposedGatewayHarness {
 
   private readonly httpServer: Server;
   private readonly webSocketServer: WebSocketServer;
+  private readonly connectionWork = new GatewayConnectionWork();
   private readonly sockets = new Set<WebSocket>();
   private readonly socketCleanups = new Set<() => void>();
   private readonly requestMethods = new Map<string, string>();
   private readonly faults: FaultRule[] = [];
   private readonly liveEventGates: LiveEventGate[] = [];
-  private serviceValue!: workerEnv.WorkerEnvironmentService;
+  serviceValue!: workerEnv.WorkerEnvironmentService;
   private liveEventsValue!: liveEvents.WorkerLiveEventReceiver;
   private readonly placementLifecycle: WorkerFaultPlacementLifecycle;
   private placementGateValue: WorkerSessionPlacementGate | undefined;
@@ -242,7 +241,7 @@ export class ComposedGatewayHarness {
       sessionId: SESSION_ID,
       sessionKey: SESSION_KEY,
     });
-    this.placementGateValue = this.createPlacementGate();
+    this.placementGateValue = createWorkerSessionPlacementGate(this.placementStore);
     this.serviceValue = this.createService();
     this.httpServer = createServer();
     this.webSocketServer = new WebSocketServer({ server: this.httpServer });
@@ -256,11 +255,7 @@ export class ComposedGatewayHarness {
   }
 
   get epoch(): number {
-    const record = this.store.get(ENVIRONMENT_ID);
-    if (!record) {
-      throw new Error("fault environment missing");
-    }
-    return record.ownerEpoch;
+    return expectDefined(this.store.get(ENVIRONMENT_ID), "fault environment missing").ownerEpoch;
   }
 
   async start(): Promise<void> {
@@ -364,7 +359,9 @@ export class ComposedGatewayHarness {
     this.abandonedServices.push(this.serviceValue);
     this.liveEventsValue.clear();
     this.liveEventsValue = this.createLiveEvents(false);
-    this.placementGateValue = this.createPlacementGate({ rejectExistingWorkerClaims: true });
+    this.placementGateValue = createWorkerSessionPlacementGate(this.placementStore, {
+      rejectExistingWorkerClaims: true,
+    });
     this.useReplacementExecutor = true;
     this.serviceValue = this.createService();
     this.terminateSockets();
@@ -454,6 +451,8 @@ export class ComposedGatewayHarness {
       cleanup();
     }
     this.socketCleanups.clear();
+    this.connectionWork.beginClose();
+    await this.connectionWork.drain();
     await this.serviceValue.stop();
     for (const service of this.abandonedServices) {
       await service.stop();
@@ -468,7 +467,12 @@ export class ComposedGatewayHarness {
     await new Promise<void>((resolve) => {
       this.httpServer.close(() => resolve());
     });
-    stateDb.closeOpenClawStateDatabaseForTest();
+    // Session writes can retain maintenance workers after their request settles.
+    // Join this fixture's database owners before removing their files.
+    await cleanupSessionStateForTest({
+      stateDir: path.join(this.root, "state"),
+      rootPath: this.root,
+    });
     await fs.rm(this.root, { recursive: true, force: true });
   }
 
@@ -607,12 +611,6 @@ export class ComposedGatewayHarness {
     });
   }
 
-  private createPlacementGate(
-    options: { rejectExistingWorkerClaims?: boolean } = {},
-  ): WorkerSessionPlacementGate {
-    return createWorkerSessionPlacementGate(this.placementStore, options);
-  }
-
   private matchesLiveEventGate(gate: LiveEventGate, request: WorkerLiveEventParams): boolean {
     if (gate.target === "preview") {
       return request.event.kind === "assistant" || request.event.kind === "thinking";
@@ -642,6 +640,7 @@ export class ComposedGatewayHarness {
     const service = this.serviceValue;
     const cleanup = workerServer.attachWorkerWsMessageHandler({
       socket,
+      connectionWork: this.connectionWork,
       connId,
       service: {
         ...service,
@@ -694,7 +693,7 @@ export class ComposedGatewayHarness {
     });
   }
 
-  private send(socket: WebSocket, frame: unknown): void {
+  private send(socket: WebSocket, frame: unknown) {
     const response =
       frame && typeof frame === "object" && !Array.isArray(frame)
         ? (frame as { event?: unknown; id?: unknown; payload?: { seq?: unknown } })
@@ -714,17 +713,18 @@ export class ComposedGatewayHarness {
       } else {
         socket.terminate();
       }
-      return;
+      return { kind: "unavailable" } as const;
     }
     if (socket.readyState !== WebSocket.OPEN) {
-      return;
+      return { kind: "unavailable" } as const;
     }
     const encoded = JSON.stringify(frame);
     if (fault?.kind === "partition-after-inference-event") {
       socket.send(encoded, () => socket.terminate());
-      return;
+    } else {
+      socket.send(encoded);
     }
-    socket.send(encoded);
+    return { kind: "sent" } as const;
   }
 
   private terminateSockets(): void {

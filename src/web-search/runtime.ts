@@ -13,13 +13,13 @@ import {
 } from "../config/runtime-snapshot.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { logVerbose } from "../globals.js";
+import { sortPluginEntriesForAutoDetect } from "../plugins/plugin-entry-order.js";
 import { resolveManifestContractOwnerPluginId } from "../plugins/plugin-registry-contributions.js";
 import type { PluginWebSearchProviderEntry } from "../plugins/types.js";
 import {
   resolvePluginWebSearchProviders,
   resolveRuntimeWebSearchProviders,
 } from "../plugins/web-search-providers.runtime.js";
-import { sortWebSearchProvidersForAutoDetect } from "../plugins/web-search-providers.shared.js";
 import { getActiveRuntimeWebToolsMetadataFromState } from "../secrets/runtime-web-tools-state.js";
 import type { RuntimeWebSearchMetadata } from "../secrets/runtime-web-tools.types.js";
 import {
@@ -158,7 +158,7 @@ export function resolveWebSearchProviderId(params: {
 }): string {
   const config = resolveWebSearchRuntimeConfig({ config: params.config });
   const search = params.search ?? resolveSearchConfig(config);
-  const providers = sortWebSearchProvidersForAutoDetect(
+  const providers = sortPluginEntriesForAutoDetect(
     params.providers ??
       resolvePluginWebSearchProviders({
         config,
@@ -271,7 +271,7 @@ function loadSortedWebSearchProviders(
   const resolveProviders = params.preferRuntimeProviders
     ? resolveRuntimeWebSearchProviders
     : resolvePluginWebSearchProviders;
-  return sortWebSearchProvidersForAutoDetect(
+  return sortPluginEntriesForAutoDetect(
     resolveProviders({
       config: params.config,
       ...(pluginId ? { onlyPluginIds: [pluginId] } : {}),
@@ -281,8 +281,9 @@ function loadSortedWebSearchProviders(
 
 function resolveWebSearchCandidates(
   options?: ResolveWebSearchDefinitionParams,
+  context = resolveWebSearchRequestContext(options),
 ): PluginWebSearchProviderEntry[] {
-  const { config, search, runtimeWebSearch } = resolveWebSearchRequestContext(options);
+  const { config, search, runtimeWebSearch } = context;
   if (search?.enabled === false) {
     return [];
   }
@@ -384,19 +385,12 @@ function hasExplicitWebSearchSelection(params: {
 
 /** Executes web_search with fallback when selection was not explicit. */
 export async function runWebSearch(params: RunWebSearchParams): Promise<RunWebSearchResult> {
-  const config = resolveWebSearchRuntimeConfig({
-    config: params.config,
-    preferInputConfig: params.preferInputConfig,
-  });
-  const search = resolveSearchConfig(config);
-  const runtimeWebSearch =
-    params.runtimeWebSearch ?? getActiveRuntimeWebToolsMetadataFromState()?.search;
-  const candidates = resolveWebSearchCandidates({
-    ...params,
-    config,
-    runtimeWebSearch,
-    preferRuntimeProviders: params.preferRuntimeProviders ?? true,
-  });
+  const context = resolveWebSearchRequestContext(params);
+  const { config, search, runtimeWebSearch } = context;
+  const candidates = resolveWebSearchCandidates(
+    { ...params, preferRuntimeProviders: params.preferRuntimeProviders ?? true },
+    context,
+  );
   if (candidates.length === 0) {
     throw new Error("web_search is disabled or no provider is available.");
   }

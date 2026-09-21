@@ -1,3 +1,4 @@
+import { err, ok, type Result } from "@openclaw/normalization-core/result";
 import {
   ErrorCodes,
   errorShape,
@@ -7,6 +8,7 @@ import {
 } from "../../packages/gateway-protocol/src/index.js";
 import { GATEWAY_OWNER_PROFILE_ID } from "../../packages/gateway-protocol/src/schema/users.js";
 import { isSessionMember, type SessionEntry } from "../config/sessions.js";
+import { sessionCreatorProfileId } from "../config/sessions/session-entry-provenance.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { isIncognitoSessionKey } from "../routing/session-key.js";
 import {
@@ -17,19 +19,18 @@ import {
 } from "./operator-role-policy.js";
 import {
   authenticatedProfileUnavailableError,
-  gatewayClientSessionCreator,
   isGatewayClientProfilePending,
 } from "./server-methods/gateway-client-identity.js";
 import type { GatewayClient } from "./server-methods/types.js";
 import { prepareSessionCreatorProfile } from "./session-creator.js";
-import type {
-  GatewaySessionStoreCache,
-  GatewaySessionStoreDiscoveryCache,
-} from "./session-utils-store-lookup.js";
 import {
-  resolveCanonicalSessionStoreMatchFromStoreKeys,
+  prepareGatewaySessionStoreTargetsReadOnly,
+  resolveGatewaySessionStoreTargetsReadOnly,
   resolveGatewaySessionStoreTargetWithStore,
-} from "./session-utils.js";
+  type GatewaySessionStoreCache,
+  type GatewaySessionStoreDiscoveryCache,
+} from "./session-utils-store-lookup.js";
+import { resolveCanonicalSessionStoreMatchFromStoreKeys } from "./session-utils-store.js";
 
 export type SessionSharingTarget = {
   agentId: string;
@@ -44,6 +45,23 @@ export function resolveSessionVisibility(
   entry: Pick<SessionEntry, "visibility">,
 ): SessionVisibility {
   return entry.visibility ?? "shared";
+}
+
+/** Compare access facts only after the mutation owner has preserved the canonical target. */
+export function hasSessionReadAccessChanged(
+  previous: SessionEntry | undefined,
+  current: SessionEntry,
+): boolean {
+  return (
+    !previous?.sessionId?.trim() ||
+    !previous.lifecycleRevision?.trim() ||
+    previous.sessionId !== current.sessionId ||
+    previous.lifecycleRevision !== current.lifecycleRevision ||
+    sessionCreatorProfileId(previous.createdActor) !==
+      sessionCreatorProfileId(current.createdActor) ||
+    resolveSessionVisibility(previous) !== resolveSessionVisibility(current) ||
+    (previous.incognito === true) !== (current.incognito === true)
+  );
 }
 
 export function isGatewayAdmin(client: Pick<GatewayClient, "connect"> | null): boolean {
@@ -73,6 +91,7 @@ export function resolveSessionSharingTarget(params: {
   cfg: OpenClawConfig;
   sessionKey: string;
   agentId?: string;
+  exactRead?: boolean;
   storeCache?: GatewaySessionStoreCache;
   targetDiscoveryCache?: GatewaySessionStoreDiscoveryCache;
 }): SessionSharingTarget | null {
@@ -85,10 +104,27 @@ export function resolveSessionSharingTarget(params: {
     projection: "list",
     // Batch callers reuse one store snapshot; single-target checks must not
     // materialize unrelated sessions for every task or authorization recheck.
-    exactRead: !params.storeCache,
+    exactRead: params.exactRead ?? !params.storeCache,
     ...(params.storeCache ? { storeCache: params.storeCache } : {}),
     ...(params.targetDiscoveryCache ? { targetDiscoveryCache: params.targetDiscoveryCache } : {}),
   });
+  return toSessionSharingTarget(target);
+}
+
+/** Fresh metadata for one synchronous batch; no authorization decisions are retained. */
+export function resolveSessionSharingTargets(params: {
+  cfg: OpenClawConfig;
+  targets: readonly { sessionKey: string; agentId?: string }[];
+}): Array<SessionSharingTarget | null> {
+  return resolveGatewaySessionStoreTargetsReadOnly({
+    cfg: params.cfg,
+    targets: params.targets.map(({ sessionKey, agentId }) => ({ key: sessionKey, agentId })),
+  }).map(toSessionSharingTarget);
+}
+
+function toSessionSharingTarget(
+  target: ReturnType<typeof resolveGatewaySessionStoreTargetWithStore>,
+): SessionSharingTarget | null {
   const match = resolveCanonicalSessionStoreMatchFromStoreKeys(target.store, target.storeKeys);
   return match
     ? {
@@ -100,6 +136,27 @@ export function resolveSessionSharingTarget(params: {
         storePath: target.storePath,
       }
     : null;
+}
+
+/** Prepare one synchronous batch while retaining each target's failure for ordered consumption. */
+export function prepareSessionSharingTargets(params: {
+  cfg: OpenClawConfig;
+  targets: readonly { sessionKey: string; agentId?: string }[];
+}): Array<Result<SessionSharingTarget | null, unknown>> {
+  return prepareGatewaySessionStoreTargetsReadOnly({
+    cfg: params.cfg,
+    targets: params.targets.map(({ sessionKey, agentId }) => ({ key: sessionKey, agentId })),
+    projection: "list",
+  }).map((result) => {
+    if (!result.ok) {
+      return result;
+    }
+    try {
+      return ok(toSessionSharingTarget(result.value));
+    } catch (error) {
+      return err(error);
+    }
+  });
 }
 
 export type SessionSharingRoleParams = {
@@ -115,7 +172,8 @@ export function sharingIdentity(
   actor: ReturnType<typeof resolveGatewayOperatorRoleActor>,
 ) {
   const operator = actor?.kind === "operator" ? { id: actor.profileId } : undefined;
-  const identity = gatewayClientSessionCreator(client) ?? operator;
+  const profile = client?.authenticatedUserProfile;
+  const identity = profile ? { id: profile.profileId } : operator;
   // Owner attribution never narrows sharing; solo deployments stay owner-equivalent.
   return identity?.id === GATEWAY_OWNER_PROFILE_ID ? undefined : identity;
 }
@@ -280,7 +338,9 @@ export function authorizeResolvedSessionMutation(params: {
 export function authorizeSessionAgentRun(params: {
   cfg: OpenClawConfig;
   client: GatewayClient | null;
-  target: SessionSharingTarget;
+  target: Pick<SessionSharingTarget, "agentId" | "canonicalKey"> & {
+    entry?: Pick<SessionEntry, "sandbox">;
+  };
 }): ErrorShape | null {
   const agentError = authorizeGatewaySessionCreation({
     cfg: params.cfg,
@@ -292,7 +352,7 @@ export function authorizeSessionAgentRun(params: {
   }
   if (
     params.cfg.gateway?.roles &&
-    params.target.entry.sandbox !== "required" &&
+    params.target.entry?.sandbox !== "required" &&
     resolveOperatorRolePolicy(params.client, params.cfg)?.sandbox === "required"
   ) {
     return errorShape(
@@ -303,14 +363,15 @@ export function authorizeSessionAgentRun(params: {
   return null;
 }
 
-export function authorizeSessionSharingTarget(params: {
-  cfg?: OpenClawConfig;
-  client: GatewayClient | null;
-  target: SessionSharingTarget;
-}): ErrorShape | null {
+export function authorizeSessionSharingTarget(
+  params: SessionSharingRoleParams,
+  prepared?: { value: ReturnType<typeof operatorSessionCap>; role: SessionSharingRole },
+): ErrorShape | null {
   const visibility = resolveSessionVisibility(params.target.entry);
-  const sessionCap = params.cfg && operatorSessionCap(params.client, params.cfg);
-  const role = resolveSessionSharingRole(params, { value: sessionCap });
+  const sessionCap = prepared
+    ? prepared.value
+    : params.cfg && operatorSessionCap(params.client, params.cfg);
+  const role = prepared?.role ?? resolveSessionSharingRole(params, { value: sessionCap });
   if (sessionCap === "none" && role !== "owner" && role !== "admin") {
     return hiddenSessionNotFound(params.target.canonicalKey);
   }

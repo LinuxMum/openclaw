@@ -4,13 +4,17 @@ import {
   createExecutionIdentityAdmissionToken,
   type ExecutionIdentityAdmissionWork,
 } from "../audit/execution-identity-admission.js";
+import { withPostAdmissionExecutionOwnerBinding } from "../audit/execution-owner-binding.js";
 import { validateAgentRunDelegatedAuthority } from "../infra/agent-run-registry.js";
 import {
   closeAdmittedRunDelegatedAuthority,
   createExecutionIdentityRecoveryAdmission,
   createOperationalRunInstanceRef,
+  createAdmittedRunOperatorAuthority,
   getAdmittedRunDelegatedAuthority,
   prepareAgentRunAdmission,
+  readAdmittedRunOperatorAuthority,
+  readPreparedRunOperatorAuthority,
   retainAdmittedRunBeforeToolCallRecovery,
   resolveAdmittedRunActiveAssertion,
   resolvePreparedRunAdmission,
@@ -83,6 +87,7 @@ describe("prepared run admission", () => {
       first.operationalRunInstance.instanceId,
     );
     expect(first).not.toHaveProperty("executionIdentityToken");
+    expect(readAdmittedRunOperatorAuthority(first)).toBeUndefined();
     expect(Object.isFrozen(first)).toBe(true);
     expect(Object.isFrozen(first.operationalRunInstance)).toBe(true);
   });
@@ -270,6 +275,7 @@ describe("prepared run admission", () => {
     ).resolves.toBe(admitted);
     expect(getAdmittedRunDelegatedAuthority(admitted)).toBe(first);
     prepared.close();
+    expect(() => prepared.assertSourceCurrent()).not.toThrow();
     expect(validateAgentRunDelegatedAuthority(first)).toBe(false);
     expect(closeAdmittedRunDelegatedAuthority(admitted)).toBe(false);
     await expect(prepared.admit(runtime.kind)).rejects.toThrow("already closed");
@@ -316,6 +322,79 @@ describe("prepared run admission", () => {
     expect(() => recovery?.assertActive()).toThrow("no longer active");
     recovery?.release();
   });
+
+  it.each([false, true])(
+    "keeps retained native policy fenced after foreground close (refusedRebind=%s)",
+    async (refusedRebind) => {
+      let current = true;
+      let sourceHolds = 0;
+      const { runtime, ...admissionFacts } = facts;
+      const source = prepareAgentRunAdmission({
+        cfg: {},
+        facts: { ...admissionFacts, runId: "native-source-lease" },
+        operationalRunInstance: createOperationalRunInstanceRef("native-source-lease"),
+        operatorAuthority: createAdmittedRunOperatorAuthority({
+          profileId: "native-operator",
+          scopes: ["operator.write"],
+          assertCurrent: () => {
+            if (!current || sourceHolds === 0) {
+              throw new Error("source claim lost");
+            }
+          },
+          retain: () => {
+            sourceHolds += 1;
+            let released = false;
+            return () => {
+              if (!released) {
+                released = true;
+                sourceHolds -= 1;
+              }
+            };
+          },
+        }),
+      });
+      const prepared = withPostAdmissionExecutionOwnerBinding(source, () => {});
+      expect(readPreparedRunOperatorAuthority(prepared)?.profileId).toBe("native-operator");
+      const admitted = await prepared.admit(runtime.kind);
+      const recovery = retainAdmittedRunBeforeToolCallRecovery(admitted);
+      expect(recovery).toBeDefined();
+      try {
+        if (refusedRebind) {
+          const refused = prepareAgentRunAdmission({
+            cfg: {},
+            facts: { ...admissionFacts, runId: "native-source-lease" },
+            operationalRunInstance: admitted.operationalRunInstance,
+            assertSourceCurrent: () => {},
+          });
+          try {
+            await expect(refused.admit(runtime.kind)).rejects.toThrow("already bound");
+          } finally {
+            refused.close();
+          }
+          expect(() => recovery!.assertActive()).not.toThrow();
+        }
+        prepared.close();
+        expect(sourceHolds).toBe(1);
+        expect(() => readAdmittedRunOperatorAuthority(admitted)).toThrow("no longer active");
+        expect(() => readPreparedRunOperatorAuthority(prepared)).toThrow("no longer active");
+        expect(() => prepared.assertSourceCurrent()).not.toThrow();
+        expect(() => recovery!.assertActive()).not.toThrow();
+        current = false;
+        expect(() => recovery!.assertActive()).toThrow("source claim lost");
+        current = true;
+        expect(() => recovery!.assertActive()).toThrow(
+          "source execution authority is no longer active",
+        );
+        expect(() => prepared.assertSourceCurrent()).toThrow(
+          "source execution authority is no longer active",
+        );
+      } finally {
+        recovery?.release();
+        prepared.close();
+        expect(sourceHolds).toBe(0);
+      }
+    },
+  );
 
   it("closes admitted authority when the owner binding hook fails", async () => {
     const { runtime, ...admissionFacts } = facts;

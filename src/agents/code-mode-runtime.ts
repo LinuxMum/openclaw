@@ -1,6 +1,5 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { readNonBlankString } from "@openclaw/normalization-core/string-coerce";
-import { uniqueValues } from "@openclaw/normalization-core/string-normalization";
 import { normalizeAgentModelRefForConfig } from "../config/model-input.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { formatErrorMessage } from "../infra/errors.js";
@@ -9,11 +8,12 @@ import { clampNumber } from "../utils.js";
 import { resolveAgentConfig } from "./agent-scope-config.js";
 import type { CodeModeOutputSource } from "./code-mode-json.js";
 import type { CodeModeNamespaceRuntime } from "./code-mode-namespaces.js";
-import type {
-  CodeModeConfig as CodeModeWorkerConfig,
-  CodeModeFailurePhase,
-  CodeModeLanguage,
-  CodeModeWorkerThreadResult,
+import { CODE_MODE_RESULTS_API_FILE } from "./code-mode-results-api.js";
+import {
+  MAX_CODE_MODE_PENDING_TOOL_CALLS,
+  type CodeModeConfig as CodeModeWorkerConfig,
+  type CodeModeFailurePhase,
+  type CodeModeWorkerThreadResult,
 } from "./code-mode-worker-types.js";
 import type { ToolSearchConfig, ToolSearchToolContext } from "./tool-search.js";
 import { asToolParamsRecord, ToolInputError } from "./tools/common.js";
@@ -26,7 +26,7 @@ const DEFAULT_MAX_PENDING_TOOL_CALLS = 16;
 const DEFAULT_SNAPSHOT_TTL_SECONDS = 900;
 const DEFAULT_SEARCH_LIMIT = 8;
 const DEFAULT_MAX_SEARCH_LIMIT = 50;
-export const CODE_MODE_WORKER_WATCHDOG_GRACE_MS = 2_000;
+export { CODE_MODE_WORKER_WATCHDOG_GRACE_MS } from "./code-mode-worker-types.js";
 export const DEFAULT_HEADLESS_WALL_CLOCK_MS = 30_000;
 // Cron script payloads persist caps of 900 seconds and 200 tool calls.
 // The shared executor must not silently lower those accepted job limits.
@@ -34,9 +34,7 @@ export const MAX_HEADLESS_WALL_CLOCK_MS = 900_000;
 export const DEFAULT_HEADLESS_TOOL_CALLS = 5;
 export const MAX_HEADLESS_TOOL_CALLS = 200;
 
-export type { CodeModeLanguage } from "./code-mode-worker-types.js";
-
-/** Resolved Code Mode runtime limits and visible language options. */
+/** Resolved Code Mode runtime limits. */
 export type CodeModeConfig = CodeModeWorkerConfig & {
   /** Effective activation policy; "auto" follows the model catalog flag. */
   enabled: boolean | "auto";
@@ -137,17 +135,7 @@ export function readPositiveInteger(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
-function readLanguages(value: unknown): CodeModeLanguage[] {
-  if (!Array.isArray(value)) {
-    return ["javascript", "typescript"];
-  }
-  const languages = value.filter(
-    (entry): entry is CodeModeLanguage => entry === "javascript" || entry === "typescript",
-  );
-  return languages.length > 0 ? uniqueValues(languages) : ["javascript", "typescript"];
-}
-
-/** Resolves Code Mode runtime limits and language support from config. */
+/** Resolves Code Mode runtime limits from config. */
 export function resolveCodeModeConfig(
   config?: OpenClawConfig,
   agentId?: string,
@@ -163,7 +151,6 @@ export function resolveCodeModeConfig(
     enabled: readEnabled(raw.enabled),
     runtime: "quickjs-wasi",
     mode: "only",
-    languages: readLanguages(raw.languages),
     timeoutMs: clampNumber(readPositiveInteger(raw.timeoutMs, DEFAULT_TIMEOUT_MS), 100, 60_000),
     memoryLimitBytes: clampNumber(
       readPositiveInteger(raw.memoryLimitBytes, DEFAULT_MEMORY_LIMIT_BYTES),
@@ -183,7 +170,7 @@ export function resolveCodeModeConfig(
     maxPendingToolCalls: clampNumber(
       readPositiveInteger(raw.maxPendingToolCalls, DEFAULT_MAX_PENDING_TOOL_CALLS),
       1,
-      128,
+      MAX_CODE_MODE_PENDING_TOOL_CALLS,
     ),
     snapshotTtlSeconds: clampNumber(
       readPositiveInteger(raw.snapshotTtlSeconds, DEFAULT_SNAPSHOT_TTL_SECONDS),
@@ -271,7 +258,6 @@ export function codeModeFailureMessage(error: unknown): string {
 
 export function readCode(args: unknown): {
   code: string;
-  language?: CodeModeLanguage;
   restartSafe: boolean;
 } {
   const params = asToolParamsRecord(args);
@@ -286,15 +272,19 @@ export function readCode(args: unknown): {
   if (code === undefined) {
     throw new ToolInputError("code or command must be a non-empty string.");
   }
-  const language = params.language;
-  if (language !== undefined && language !== "javascript" && language !== "typescript") {
-    throw new ToolInputError("language must be javascript or typescript.");
+  if (params.language !== undefined || params.typecheck !== undefined) {
+    throw new ToolInputError(
+      "Code Mode accepts JavaScript only. Remove language and typecheck; use API.read(...) for tool types.",
+    );
   }
   const restartSafe = params.restartSafe;
   if (restartSafe !== undefined && typeof restartSafe !== "boolean") {
     throw new ToolInputError("restartSafe must be a boolean.");
   }
-  return { code, language, restartSafe: restartSafe === true };
+  return {
+    code,
+    restartSafe: restartSafe === true,
+  };
 }
 
 export function readRunId(args: unknown): string {
@@ -311,5 +301,8 @@ export function createCodeModeApiFilesForRun(
   swarmEnabled: boolean,
 ) {
   const { apiFiles: files } = namespaceRuntime;
-  return swarmEnabled ? files : files.filter((file) => file.path !== "agents.d.ts");
+  return [
+    CODE_MODE_RESULTS_API_FILE,
+    ...(swarmEnabled ? files : files.filter((file) => file.path !== "agents.d.ts")),
+  ];
 }

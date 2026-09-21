@@ -21,7 +21,7 @@ const persistedConfigResultMock = vi.fn((config: OpenClawConfig) => config);
 const runtimeApplication = { claimed: true };
 const validateConfigObjectWithPluginsMock = vi.fn();
 const prepareSecretsRuntimeSnapshotMock = vi.fn();
-const scheduleGatewaySigusr1RestartMock = vi.fn(() => ({
+const scheduleGatewayRestartMock = vi.fn(() => ({
   scheduled: true,
   delayMs: 1_000,
   coalesced: false,
@@ -37,16 +37,16 @@ vi.mock("../../config/config.js", async () => {
     ...actual,
     createConfigIO: () => ({ configPath: "/tmp/openclaw.json" }),
     writeConfigFile: writeConfigFileMock,
-    replaceConfigFile: async (params: { nextConfig: OpenClawConfig; writeOptions?: object }) => {
-      await writeConfigFileMock(params.nextConfig, params.writeOptions);
+    replaceConfigFile: async (params: { sourceConfig: OpenClawConfig; writeOptions?: object }) => {
+      await writeConfigFileMock(params.sourceConfig, params.writeOptions);
       if (params.writeOptions && runtimeApplication.claimed) {
         getRuntimeConfigWriteApplication(params.writeOptions)?.claim()?.settle("applied");
       }
-      const persistedConfig = persistedConfigResultMock(params.nextConfig);
+      const persistedConfig = persistedConfigResultMock(params.sourceConfig);
       return {
         path: "/tmp/openclaw.json",
         previousHash: "base-hash",
-        snapshot: createConfigWriteSnapshot(params.nextConfig),
+        snapshot: createConfigWriteSnapshot(params.sourceConfig),
         nextConfig: persistedConfig,
         persistedHash: "next-hash",
         afterWrite: { mode: "auto" },
@@ -88,7 +88,7 @@ vi.mock("../../secrets/runtime-state.js", () => ({
 }));
 
 vi.mock("../../infra/restart.js", () => ({
-  scheduleGatewaySigusr1Restart: scheduleGatewaySigusr1RestartMock,
+  scheduleGatewayRestart: scheduleGatewayRestartMock,
 }));
 
 vi.mock("../../infra/restart-sentinel.js", async () => {
@@ -192,7 +192,7 @@ async function runConfigPatch(
 }
 
 function expectNoDirectRestart(): void {
-  expect(scheduleGatewaySigusr1RestartMock).not.toHaveBeenCalled();
+  expect(scheduleGatewayRestartMock).not.toHaveBeenCalled();
 }
 
 afterEach(() => {
