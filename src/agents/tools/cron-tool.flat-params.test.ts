@@ -525,6 +525,53 @@ describe("cron tool flat-params", () => {
     ).toThrow('"tz" is only valid alongside "expr"');
   });
 
+  it("accepts a cron schedule object with a top-level timezone on add", () => {
+    const tool = createCronTool();
+
+    const prepared = tool.prepareArguments?.({
+      action: "add",
+      schedule: { kind: "cron", expr: "0 9 * * *" },
+      tz: "UTC",
+      message: "test",
+    }) as { job?: { schedule?: unknown } };
+
+    expect(prepared.job?.schedule).toEqual({ kind: "cron", expr: "0 9 * * *", tz: "UTC" });
+  });
+
+  it("infers a cron schedule object kind before accepting top-level timezone on add", () => {
+    const tool = createCronTool();
+
+    const prepared = tool.prepareArguments?.({
+      action: "add",
+      schedule: { expr: "0 9 * * *" },
+      tz: "UTC",
+      message: "test",
+    }) as { job?: { schedule?: unknown } };
+
+    expect(prepared.job?.schedule).toEqual({ kind: "cron", expr: "0 9 * * *", tz: "UTC" });
+  });
+
+  it("keeps rejecting a top-level timezone without a cron schedule on add", () => {
+    const tool = createCronTool();
+
+    expect(() => tool.prepareArguments?.({ action: "add", tz: "UTC", message: "test" })).toThrow(
+      '"tz" is only valid alongside "expr"',
+    );
+  });
+
+  it("rejects top-level timezone with a non-cron schedule on add", () => {
+    const tool = createCronTool();
+
+    expect(() =>
+      tool.prepareArguments?.({
+        action: "add",
+        everyMs: 3_600_000,
+        tz: "UTC",
+        message: "test",
+      }),
+    ).toThrow();
+  });
+
   it("resolves a flat message/text payload conflict by precedence, not rejection", () => {
     const tool = createCronTool();
 

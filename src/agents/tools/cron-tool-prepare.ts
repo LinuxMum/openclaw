@@ -94,12 +94,7 @@ function assertFlatContractInvariants(
       );
     }
   }
-  if (
-    action === "add" &&
-    next.tz !== undefined &&
-    next.expr === undefined &&
-    next.cron === undefined
-  ) {
+  if (action === "add" && next.tz !== undefined && kind !== "cron") {
     throw new Error('"tz" is only valid alongside "expr"; add a cron expression or drop "tz".');
   }
 }
