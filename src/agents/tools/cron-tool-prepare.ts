@@ -12,7 +12,22 @@ function normalizeStringArrayHint(value: unknown): unknown {
     return value;
   }
   const trimmed = value.trim();
-  return trimmed ? [trimmed] : value;
+  if (!trimmed) {
+    return value;
+  }
+  // This runs before validateToolArguments, whose array coercion would
+  // otherwise decode a JSON-encoded list; wrapping it would hide that list.
+  if (trimmed.startsWith("[")) {
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch {
+      // Not a JSON array; treat it as a single scalar entry.
+    }
+  }
+  return [trimmed];
 }
 
 function normalizePayloadArrayHints(value: unknown): void {

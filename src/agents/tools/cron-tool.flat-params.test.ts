@@ -319,6 +319,89 @@ describe("cron tool flat-params", () => {
     expect(params.payload?.toolsAllow).toEqual([]);
   });
 
+  it("decodes JSON-encoded nested payload array hints instead of wrapping them", () => {
+    const tool = createCronTool();
+    const prepared = tool.prepareArguments?.({
+      action: "add",
+      job: {
+        schedule: { kind: "every", everyMs: 60_000 },
+        payload: {
+          message: "Run the report",
+          toolsAllow: ' ["read", "web_search"] ',
+          fallbacks: '["openai/gpt-5-mini"]',
+        },
+      },
+    });
+
+    expect(prepared).toMatchObject({
+      job: {
+        payload: {
+          kind: "agentTurn",
+          toolsAllow: ["read", "web_search"],
+          fallbacks: ["openai/gpt-5-mini"],
+        },
+      },
+    });
+    expect(tool.prepareArguments?.(prepared)).toEqual(prepared);
+  });
+
+  it("decodes JSON-encoded flat array hints instead of wrapping them", () => {
+    const tool = createCronTool();
+    const prepared = tool.prepareArguments?.({
+      action: "add",
+      everyMs: 3_600_000,
+      message: "status summary",
+      name: "FLATTEST-JSON",
+      toolsAllow: '["read"]',
+      fallbacks: '["openai/gpt-5-mini", "openai/gpt-5.4"]',
+    });
+
+    expect(prepared).toMatchObject({
+      job: {
+        payload: {
+          kind: "agentTurn",
+          toolsAllow: ["read"],
+          fallbacks: ["openai/gpt-5-mini", "openai/gpt-5.4"],
+        },
+      },
+    });
+    expect(tool.prepareArguments?.(prepared)).toEqual(prepared);
+  });
+
+  it("caps a JSON-encoded flat toolsAllow to creator authority before dispatch", async () => {
+    const tool = createCronTool(
+      { creatorToolAllowlist: ["read", "cron"] },
+      { callGatewayTool: callGatewayToolMock },
+    );
+
+    await tool.execute("call-flat-toolsallow-json", {
+      action: "add",
+      everyMs: 3_600_000,
+      message: "status summary",
+      name: "FLATTEST-CAP-JSON",
+      toolsAllow: '["read", "write"]',
+    });
+
+    const [method, , params] = firstGatewayToolCall<{
+      payload?: { toolsAllow?: unknown };
+    }>();
+    expect(method).toBe("cron.add");
+    expect(params.payload?.toolsAllow).toEqual(["read"]);
+  });
+
+  it("wraps bracketed strings that are not JSON arrays as a single entry", () => {
+    const tool = createCronTool();
+    const prepared = tool.prepareArguments?.({
+      action: "add",
+      job: {
+        schedule: { kind: "every", everyMs: 60_000 },
+        payload: { message: "Run the report", toolsAllow: "[read" },
+      },
+    }) as { job?: { payload?: { toolsAllow?: unknown } } };
+
+    expect(prepared.job?.payload?.toolsAllow).toEqual(["[read"]);
+  });
+
   it("leaves blank scalar capability fields invalid", () => {
     const tool = createCronTool();
     const prepared = tool.prepareArguments?.({
