@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { normalizeCronJobPatch } from "../../cron/normalize.js";
 import { isRecord } from "../../utils.js";
 import {
@@ -52,11 +53,6 @@ function rejectTopLevelMode(): never {
   );
 }
 
-// Schedule ambiguity is rejected here; a wrong schedule fails invisibly.
-// Payload conflicts (message/text, toolsAllow) are deliberately NOT
-// rejected because their result is visible on the created job and
-// harmless to recover by documented precedence, and rejecting them would cost
-// the less capable LLM tolerance this flat contract exists to provide.
 // Per-kind schedule contract. `allowed[0]` is the defining field required by
 // the Gateway's complete discriminated union; `inputs` includes flat aliases.
 const FLAT_SCHEDULE_FIELDS_BY_KIND: Record<
@@ -79,39 +75,85 @@ function assertFlatContractInvariants(
     .flatMap((entry) => entry.inputs)
     .filter((key) => next[key] !== undefined);
   if (schedules.length > 1) {
-    throw new Error(
-      `A cron ${action} takes exactly one schedule field; received ${schedules.join(", ")}. Use "at" (one-shot ISO-8601), "everyMs" (interval), or "expr" (cron expression).`,
-    );
+    throw new Error("Send only one of at, everyMs, or expr.");
   }
   const schedule = isRecord(recovered.schedule) ? recovered.schedule : undefined;
   const kind = typeof schedule?.kind === "string" ? schedule.kind : undefined;
   const contract = kind ? FLAT_SCHEDULE_FIELDS_BY_KIND[kind] : undefined;
+  if (schedule?.tz !== undefined && kind !== "cron") {
+    throw new Error("tz needs expr. Put the offset in at, or drop tz.");
+  }
   const mismatched = contract
     ? Object.values(FLAT_SCHEDULE_FIELDS_BY_KIND)
         .flatMap((entry) => entry.allowed)
         .filter((key) => schedule?.[key] !== undefined && !contract.allowed.includes(key))
     : [];
   if (contract && mismatched.length > 0) {
-    throw new Error(
-      `A cron ${action} with "kind": "${kind}" cannot also set ${mismatched.join(", ")}. Use ${contract.allowed[0]}, or drop "kind".`,
-    );
+    throw new Error(`Use ${contract.allowed[0]} without ${mismatched.join(", ")}.`);
   }
-  if (action === "update" && schedule && Object.keys(schedule).length > 0) {
-    if (!kind) {
-      throw new Error(
-        `A cron update schedule must be complete; received ${Object.keys(schedule).join(", ")} without a schedule kind. Send the whole schedule: "at" (one-shot ISO-8601), "everyMs" (interval), or "expr" (cron expression, optionally with "tz").`,
-      );
-    }
+  if (schedule && Object.keys(schedule).length > 0) {
     const required = contract?.allowed[0];
-    if (required && schedule[required] === undefined) {
+    if (!kind || (required && schedule[required] === undefined)) {
       throw new Error(
-        `A cron update with "kind": "${kind}" must also send "${required}"; a partial schedule change is rejected by the Gateway. Send the complete schedule.`,
+        action === "add"
+          ? "Add expr, at, or everyMs."
+          : "Send a complete expr, at, or everyMs schedule.",
       );
     }
   }
-  if (action === "add" && next.tz !== undefined && kind !== "cron") {
-    throw new Error('"tz" is only valid alongside "expr"; add a cron expression or drop "tz".');
+}
+
+function assertUnambiguousPayload(job: Record<string, unknown>): void {
+  if (!isRecord(job.payload)) {
+    return;
   }
+  const { message, text } = job.payload;
+  if (
+    typeof message === "string" &&
+    message.trim() &&
+    typeof text === "string" &&
+    text.trim() &&
+    message.trim() !== text.trim()
+  ) {
+    throw new Error("Send only text (reminder) or only message (task).");
+  }
+  if (job.payload.kind === "agentTurn" && typeof text === "string" && text.trim()) {
+    if (typeof message !== "string" || !message.trim()) {
+      job.payload.message = text;
+    }
+    delete job.payload.text;
+  }
+}
+
+// Merge only the two canonical subobjects; arrays and other values are atomic.
+// Spreads retain literal unsafe keys for validation without invoking setters.
+function mergeFlatJob(
+  nested: Record<string, unknown>,
+  flat: Record<string, unknown>,
+): Record<string, unknown> {
+  let job = { ...nested };
+  for (const [key, value] of Object.entries(flat)) {
+    const existing = Object.hasOwn(job, key) ? job[key] : undefined;
+    if (existing === undefined) {
+      job = { ...job, [key]: value };
+    } else if ((key === "schedule" || key === "payload") && isRecord(existing) && isRecord(value)) {
+      let merged = { ...existing };
+      for (const [field, entry] of Object.entries(value)) {
+        if (
+          Object.hasOwn(merged, field) &&
+          merged[field] !== undefined &&
+          !isDeepStrictEqual(merged[field], entry)
+        ) {
+          throw new Error(`${field} is set twice; keep one.`);
+        }
+        merged = { ...merged, [field]: entry };
+      }
+      job = { ...job, [key]: merged };
+    } else if (!isDeepStrictEqual(existing, value)) {
+      throw new Error(`${key} is set twice; keep one.`);
+    }
+  }
+  return job;
 }
 
 /** Normalizes recoverable cron add/update arguments before provider schema validation. */
@@ -119,6 +161,16 @@ export function prepareCronToolArguments(args: unknown): Record<string, unknown>
   const next = isRecord(args) ? { ...args } : {};
   if (next.action !== "add" && next.action !== "update") {
     return next;
+  }
+  if (typeof next.job === "string") {
+    try {
+      const decoded: unknown = JSON.parse(next.job);
+      if (isRecord(decoded)) {
+        next.job = decoded;
+      }
+    } catch {
+      // Weak models also send junk job strings; retain ordinary flat recovery.
+    }
   }
   const nestedJob = hasNestedJob(next.job) ? next.job : undefined;
   const hasTopLevelMode = Object.hasOwn(next, "mode");
@@ -132,14 +184,29 @@ export function prepareCronToolArguments(args: unknown): Record<string, unknown>
     }
   }
 
+  const recovered = recoverCronObjectFromFlatParams(next, next.action !== "update");
+  normalizePayloadArrayHints(recovered.value.payload);
   if (nestedJob) {
-    const job = canonicalizeCronToolObject(nestedJob);
+    const job = canonicalizeCronToolObject(nestedJob, next.action !== "update");
     normalizePayloadArrayHints(job.payload);
-    next.job = job;
+    // A text alias can fill an explicit task prompt, but must not change its kind.
+    if (
+      isRecord(job.payload) &&
+      isRecord(recovered.value.payload) &&
+      job.payload.kind === "agentTurn" &&
+      recovered.value.payload.kind === "systemEvent" &&
+      next.kind === undefined &&
+      (!isRecord(next.payload) || next.payload.kind === undefined)
+    ) {
+      delete recovered.value.payload.kind;
+    }
+    const merged = mergeFlatJob(job, recovered.value);
+    assertUnambiguousPayload(merged);
+    assertFlatContractInvariants(next.action, next, merged);
+    next.job = merged;
     return next;
   }
 
-  const recovered = recoverCronObjectFromFlatParams(next);
   if (hasTopLevelMode) {
     const schedule = isRecord(recovered.value.schedule) ? recovered.value.schedule : undefined;
     if (schedule?.kind !== "stream") {
@@ -150,6 +217,7 @@ export function prepareCronToolArguments(args: unknown): Record<string, unknown>
     delete next.mode;
   }
 
+  assertUnambiguousPayload(recovered.value);
   assertFlatContractInvariants(next.action, next, recovered.value);
 
   if (!recovered.found) {
@@ -164,9 +232,7 @@ export function prepareCronToolArguments(args: unknown): Record<string, unknown>
     recovered.value.payload !== undefined &&
     recovered.value.schedule === undefined
   ) {
-    throw new Error(
-      'cron add requires a schedule: set "at" to an ISO-8601 timestamp, "everyMs" to an interval in milliseconds (5 minutes = 300000), or "expr" to a cron expression (optionally with "tz").',
-    );
+    throw new Error("Add expr, at, or everyMs.");
   }
   if (next.action === "update") {
     const normalizedPatch = normalizeCronJobPatch(recovered.value) ?? recovered.value;

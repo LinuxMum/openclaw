@@ -26,14 +26,15 @@ import { parseApprovalResolvedEvent } from "../../app/exec-approval.ts";
 import { readGatewayOperatorAccess } from "../../app/operator-access.ts";
 import {
   renderLearnMoreLink,
-  renderSettingsGroup,
   renderSettingsLoadingSkeleton,
   renderSettingsPage,
   renderSettingsPageHeader,
+  renderSettingsSection,
 } from "../../components/settings-ui.ts";
 import { renderSettingsWorkspace } from "../../components/settings-workspace.ts";
-import { i18n, t } from "../../i18n/index.ts";
+import { t } from "../../i18n/index.ts";
 import { formatUiError } from "../../lib/format-error.ts";
+import { formatDateTimeMs } from "../../lib/format.ts";
 import { OpenClawLightDomElement } from "../../lit/openclaw-element.ts";
 import { SubscriptionsController } from "../../lit/subscriptions-controller.ts";
 
@@ -58,13 +59,6 @@ function grantIsActive(grant: ExecApprovalStandingGrant, nowMs: number): boolean
 }
 const APPROVAL_HISTORY_REQUIRED_SCOPE = "operator.approvals";
 const APPROVALS_DOCS_URL = "https://docs.openclaw.ai/tools/exec-approvals";
-
-function formatResolvedAt(timestampMs: number): string {
-  return new Intl.DateTimeFormat(i18n.getLocale(), {
-    dateStyle: "medium",
-    timeStyle: "short",
-  }).format(new Date(timestampMs));
-}
 
 const APPROVAL_KIND_LABELS = {
   exec: "approvalHistory.kinds.exec",
@@ -186,7 +180,10 @@ class ApprovalsPage extends OpenClawLightDomElement {
     this.loading = false;
     this.loadingMore = false;
     this.historyRefreshPending = false;
+    this.revokingGrantId = null;
     if (clearData) {
+      this.grants = [];
+      this.grantsError = null;
       this.hasLoaded = false;
       this.items = [];
       this.nextCursor = null;
@@ -247,16 +244,7 @@ class ApprovalsPage extends OpenClawLightDomElement {
       this.loadingMore = true;
     }
     this.error = null;
-    const isCurrent = () =>
-      this.isConnected &&
-      this.connected &&
-      this.approvalsAccess &&
-      this.gatewaySource === gateway &&
-      this.context.gateway === gateway &&
-      gateway.snapshot.phase === "connected" &&
-      readGatewayOperatorAccess(gateway.snapshot).canReviewApprovals &&
-      this.client === client &&
-      this.requestGeneration === generation;
+    const isCurrent = () => this.isCurrentRequest(client, gateway, generation);
     try {
       const result = await client.request<ApprovalHistoryResult>("approval.history", {
         ...(cursor ? { cursor } : {}),
@@ -308,113 +296,148 @@ class ApprovalsPage extends OpenClawLightDomElement {
     }
   }
 
+  private isCurrentRequest(
+    client: GatewayBrowserClient,
+    gateway: ApplicationContext["gateway"],
+    generation: number,
+  ): boolean {
+    return (
+      this.isConnected &&
+      this.connected &&
+      this.approvalsAccess &&
+      this.gatewaySource === gateway &&
+      this.context.gateway === gateway &&
+      gateway.snapshot.phase === "connected" &&
+      readGatewayOperatorAccess(gateway.snapshot).canReviewApprovals &&
+      this.client === client &&
+      this.requestGeneration === generation
+    );
+  }
+
   private async revokeGrant(grantId: string): Promise<void> {
     const client = this.client;
-    if (!client || this.revokingGrantId !== null) {
+    const gateway = this.gatewaySource;
+    const generation = this.requestGeneration;
+    if (
+      !client ||
+      !gateway ||
+      this.revokingGrantId !== null ||
+      !this.isCurrentRequest(client, gateway, generation)
+    ) {
       return;
     }
+    const isCurrent = () => this.isCurrentRequest(client, gateway, generation);
     this.revokingGrantId = grantId;
     try {
       await client.request("exec.approval.grants.revoke", { grantId });
+      if (!isCurrent()) {
+        return;
+      }
       const nowMs = Date.now();
       this.grants = this.grants.map((grant) =>
         grant.grantId === grantId ? { ...grant, revokedAtMs: nowMs } : grant,
       );
       this.grantsError = null;
     } catch (error) {
-      this.grantsError = formatUiError(error);
+      if (isCurrent()) {
+        this.grantsError = formatUiError(error);
+      }
     } finally {
-      this.revokingGrantId = null;
+      if (isCurrent()) {
+        this.revokingGrantId = null;
+      }
     }
   }
 
   private renderGrants() {
     const nowMs = Date.now();
-    return html`
-      <h2 id="standing-grants-title" class="settings-section-title">
-        ${t("standingGrants.title")}
-      </h2>
-      <p class="settings-section-subtitle">${t("standingGrants.description")}</p>
-      ${this.grantsError ? html`<div class="callout danger" role="alert">${this.grantsError}</div>` : nothing}
-      <div class="data-table-container">
-        <table
-          class="data-table standing-grants-table settings-table--stacked"
-          role="table"
-          aria-labelledby="standing-grants-title"
-        >
-          <thead>
-            <tr>
-              <th scope="col">${t("standingGrants.columns.automation")}</th>
-              <th scope="col">${t("standingGrants.columns.command")}</th>
-              <th scope="col">${t("standingGrants.columns.uses")}</th>
-              <th scope="col">${t("standingGrants.columns.state")}</th>
-              <th scope="col"><span class="sr-only">${t("standingGrants.revoke")}</span></th>
-            </tr>
-          </thead>
-          <tbody>
-            ${
-              this.grants.length === 0
-                ? html`
-                    <tr>
-                      <td colspan="5" class="data-table-empty-cell">
-                        <div class="data-table-empty-state" role="status" aria-live="polite">
-                          ${t("standingGrants.empty")}
-                        </div>
-                      </td>
-                    </tr>
-                  `
-                : this.grants.map(
-                    (grant) => html`
+    return renderSettingsSection(
+      {
+        title: html`<span id="standing-grants-title">${t("standingGrants.title")}</span>`,
+        description: t("standingGrants.description"),
+        notice: this.grantsError
+          ? html`<div class="callout danger" role="alert">${this.grantsError}</div>`
+          : nothing,
+      },
+      html`
+        <div class="data-table-container">
+          <table
+            class="data-table standing-grants-table settings-table--stacked"
+            role="table"
+            aria-labelledby="standing-grants-title"
+          >
+            <thead>
+              <tr>
+                <th scope="col">${t("standingGrants.columns.automation")}</th>
+                <th scope="col">${t("standingGrants.columns.command")}</th>
+                <th scope="col">${t("standingGrants.columns.uses")}</th>
+                <th scope="col">${t("standingGrants.columns.state")}</th>
+                <th scope="col"><span class="sr-only">${t("standingGrants.revoke")}</span></th>
+              </tr>
+            </thead>
+            <tbody>
+              ${
+                this.grants.length === 0
+                  ? html`
                       <tr>
-                        <td data-label=${t("standingGrants.columns.automation")}>
-                          ${grant.cronJobName ?? grant.cronJobId}
-                        </td>
-                        <td class="mono" data-label=${t("standingGrants.columns.command")}>
-                          ${grant.command}
-                        </td>
-                        <td data-label=${t("standingGrants.columns.uses")}>${grant.useCount}</td>
-                        <td data-label=${t("standingGrants.columns.state")} aria-live="polite">
-                          ${grantStateLabel(grant, nowMs)}
-                        </td>
-                        <td>
-                          ${
-                            grantIsActive(grant, nowMs)
-                              ? html`
-                                  <button
-                                    class="btn btn--sm"
-                                    aria-label=${`${
-                                      this.revokingGrantId === grant.grantId
-                                        ? t("standingGrants.revoking")
-                                        : t("standingGrants.revoke")
-                                    }: ${grant.cronJobName ?? grant.cronJobId} — ${grant.command}`}
-                                    ?disabled=${this.revokingGrantId !== null}
-                                    @click=${() => void this.revokeGrant(grant.grantId)}
-                                  >
-                                    ${
-                                      this.revokingGrantId === grant.grantId
-                                        ? t("standingGrants.revoking")
-                                        : t("standingGrants.revoke")
-                                    }
-                                  </button>
-                                `
-                              : nothing
-                          }
+                        <td colspan="5" class="data-table-empty-cell">
+                          <div class="data-table-empty-state" role="status" aria-live="polite">
+                            ${t("standingGrants.empty")}
+                          </div>
                         </td>
                       </tr>
-                    `,
-                  )
-            }
-          </tbody>
-        </table>
-      </div>
-    `;
+                    `
+                  : this.grants.map(
+                      (grant) => html`
+                        <tr>
+                          <td data-label=${t("standingGrants.columns.automation")}>
+                            ${grant.cronJobName ?? grant.cronJobId}
+                          </td>
+                          <td class="mono" data-label=${t("standingGrants.columns.command")}>
+                            ${grant.command}
+                          </td>
+                          <td data-label=${t("standingGrants.columns.uses")}>${grant.useCount}</td>
+                          <td data-label=${t("standingGrants.columns.state")} aria-live="polite">
+                            ${grantStateLabel(grant, nowMs)}
+                          </td>
+                          <td>
+                            ${
+                              grantIsActive(grant, nowMs)
+                                ? html`
+                                    <button
+                                      class="btn btn--sm"
+                                      aria-label=${`${
+                                        this.revokingGrantId === grant.grantId
+                                          ? t("standingGrants.revoking")
+                                          : t("standingGrants.revoke")
+                                      }: ${grant.cronJobName ?? grant.cronJobId} — ${grant.command}`}
+                                      ?disabled=${this.revokingGrantId !== null}
+                                      @click=${() => void this.revokeGrant(grant.grantId)}
+                                    >
+                                      ${
+                                        this.revokingGrantId === grant.grantId
+                                          ? t("standingGrants.revoking")
+                                          : t("standingGrants.revoke")
+                                      }
+                                    </button>
+                                  `
+                                : nothing
+                            }
+                          </td>
+                        </tr>
+                      `,
+                    )
+              }
+            </tbody>
+          </table>
+        </div>
+      `,
+    );
   }
 
   private renderTable() {
     if (this.loading && this.items.length === 0) {
-      return renderSettingsGroup(
-        renderSettingsLoadingSkeleton({ label: t("approvalHistory.loading") }),
-      );
+      return renderSettingsLoadingSkeleton({ label: t("approvalHistory.loading") });
     }
     return html`
       <div class="data-table-container">
@@ -455,7 +478,7 @@ class ApprovalsPage extends OpenClawLightDomElement {
                     (item) => html`
                       <tr>
                         <td data-label=${t("approvalHistory.columns.resolved")}>
-                          ${formatResolvedAt(item.resolvedAtMs)}
+                          ${formatDateTimeMs(item.resolvedAtMs, { dateStyle: "medium", timeStyle: "short" })}
                         </td>
                         <td data-label=${t("approvalHistory.columns.kind")}>
                           ${t(APPROVAL_KIND_LABELS[item.presentation.kind])}
@@ -536,12 +559,16 @@ class ApprovalsPage extends OpenClawLightDomElement {
         ${this.approvalsAccess ? this.renderGrants() : nothing}
         ${
           this.approvalsAccess
-            ? html`<h2 id="approval-history-title" class="settings-section-title">
-                ${t("standingGrants.historyTitle")}
-              </h2>`
+            ? renderSettingsSection(
+                {
+                  title: html`<span id="approval-history-title">
+                    ${t("standingGrants.historyTitle")}
+                  </span>`,
+                },
+                this.renderTable(),
+              )
             : nothing
         }
-        ${this.approvalsAccess ? this.renderTable() : nothing}
       `,
       { wide: true },
     );

@@ -76,7 +76,7 @@ export function transitionOwnedDeliveryQueueEntryInDatabase(
 function transitionDeliveryQueueEntryPlatformSendInDatabase(
   database: OpenClawStateDatabase,
   params: PlatformClaimParams,
-  operation: "claim" | "promote" | "dispatch",
+  operation: "claim" | "promote" | "dispatch" | "renew",
   transition: (entry: DeliveryQueueEntryState, now: number) => DeliveryQueueEntryState | undefined,
 ): boolean {
   return runSqliteImmediateTransactionSync(
@@ -168,88 +168,40 @@ export function renewDeliveryQueueEntryPlatformSendLeaseInDatabase(
     claimId: string;
   },
 ): number | undefined {
-  return runSqliteImmediateTransactionSync(
-    database.db,
-    () => {
-      const entry = loadDeliveryQueueEntryInDatabase(
-        database,
-        params.queueName,
-        params.id,
-        "pending",
-      );
-      const now = Date.now();
+  let expiresAt: number | undefined;
+  return transitionDeliveryQueueEntryPlatformSendInDatabase(
+    database,
+    params,
+    "renew",
+    (entry, now) => {
       if (
-        !entry ||
         entry.requiresProducerClaim !== true ||
         !hasLiveDeliveryQueueClaim(entry, params.claimId, now)
       ) {
         return undefined;
       }
-      const expiresAt = now + PLATFORM_SEND_OWNER_LEASE_MS;
-      return upsertDeliveryQueueEntryInDatabase(
-        {
-          queueName: params.queueName,
-          entry: { ...entry, availableAt: expiresAt },
-          updatePendingOnly: true,
-        },
-        database,
-      )
-        ? expiresAt
-        : undefined;
+      expiresAt = now + PLATFORM_SEND_OWNER_LEASE_MS;
+      return { ...entry, availableAt: expiresAt };
     },
-    {
-      databaseLabel: database.path,
-      operationLabel: `renew ${params.queueName} delivery platform send`,
-    },
-  );
+  )
+    ? expiresAt
+    : undefined;
 }
 
-/** Atomically fence the exact unexpired owner at the real provider boundary. */
-export function promoteDeliveryQueueEntryPlatformSendInDatabase(
+function startDeliveryQueuePlatformSend(
   database: OpenClawStateDatabase,
-  params: PlatformClaimParams & {
-    claimId: string;
-    route?: { replyToId?: string | null };
-  },
+  params: Parameters<typeof promoteDeliveryQueueEntryPlatformSendInDatabase>[1],
+  operation: "promote" | "dispatch",
 ): boolean {
   return transitionDeliveryQueueEntryPlatformSendInDatabase(
     database,
     params,
-    "promote",
-    (entry, now) =>
-      entry.recoveryState === "producer_claimed" &&
-      hasLiveDeliveryQueueClaim(entry, params.claimId, now)
-        ? {
-            ...entry,
-            // Only an explicitly leased owner keeps its cross-process fence;
-            // legacy recovery must remain immediately eligible after a crash.
-            availableAt:
-              entry.requiresProducerClaim === true ? now + PLATFORM_SEND_OWNER_LEASE_MS : undefined,
-            producerClaimId: undefined,
-            platformSendAttemptId: params.claimId,
-            platformSendStartedAt: now,
-            ...(params.route && "replyToId" in params.route
-              ? { effectiveReplyToId: params.route.replyToId ?? null }
-              : {}),
-            recoveryState: "send_attempt_started",
-          }
-        : undefined,
-  );
-}
-
-export function dispatchDeliveryQueueEntryPlatformSendInDatabase(
-  database: OpenClawStateDatabase,
-  params: PlatformClaimParams & {
-    claimId: string;
-    route?: { replyToId?: string | null };
-  },
-): boolean {
-  return transitionDeliveryQueueEntryPlatformSendInDatabase(
-    database,
-    params,
-    "dispatch",
+    operation,
     (entry, now) => {
-      if (!hasLiveDeliveryQueueClaim(entry, params.claimId, now)) {
+      if (
+        (operation === "promote" && entry.recoveryState !== "producer_claimed") ||
+        !hasLiveDeliveryQueueClaim(entry, params.claimId, now)
+      ) {
         return undefined;
       }
       return {
@@ -275,4 +227,25 @@ export function dispatchDeliveryQueueEntryPlatformSendInDatabase(
       };
     },
   );
+}
+
+/** Atomically fence the exact unexpired owner at the real provider boundary. */
+export function promoteDeliveryQueueEntryPlatformSendInDatabase(
+  database: OpenClawStateDatabase,
+  params: PlatformClaimParams & {
+    claimId: string;
+    route?: { replyToId?: string | null };
+  },
+): boolean {
+  return startDeliveryQueuePlatformSend(database, params, "promote");
+}
+
+export function dispatchDeliveryQueueEntryPlatformSendInDatabase(
+  database: OpenClawStateDatabase,
+  params: PlatformClaimParams & {
+    claimId: string;
+    route?: { replyToId?: string | null };
+  },
+): boolean {
+  return startDeliveryQueuePlatformSend(database, params, "dispatch");
 }
