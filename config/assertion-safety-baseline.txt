@@ -1497,7 +1497,7 @@ src/agents/tools/conversation-tools.ts	2
 src/agents/tools/cron-tool-context.ts	1
 src/agents/tools/cron-tool-schema.ts	1
 src/agents/tools/cron-tool-write.ts	2
-src/agents/tools/cron-tool.ts	5
+src/agents/tools/cron-tool.ts	3
 src/agents/tools/dashboard-tool.ts	1
 src/agents/tools/embedded-gateway-stub.ts	7
 src/agents/tools/gateway-tool.ts	2
@@ -1752,7 +1752,6 @@ src/cli/update-cli/update-command-plugins.ts	1
 src/cli/users-cli.ts	1
 src/commands/agent-exec.ts	1
 src/commands/agent-via-gateway.ts	6
-src/commands/agents.commands.bind.ts	2
 src/commands/agents.commands.identity.ts	1
 src/commands/agents.config.ts	1
 src/commands/agents.providers.ts	4
@@ -1761,7 +1760,7 @@ src/commands/backup-restore.ts	1
 src/commands/backup-schedule.ts	1
 src/commands/backup-verify.ts	2
 src/commands/channel-setup/config-compatibility.ts	2
-src/commands/channel-setup/discovery.ts	8
+src/commands/channel-setup/discovery.ts	6
 src/commands/channel-test-registry.ts	2
 src/commands/channels/add-wizard.ts	1
 src/commands/channels/add.ts	2

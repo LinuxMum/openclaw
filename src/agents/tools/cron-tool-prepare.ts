@@ -126,18 +126,23 @@ function assertUnambiguousPayload(job: Record<string, unknown>): void {
 }
 
 // Merge only the two canonical subobjects; arrays and other values are atomic.
-// Spreads retain literal unsafe keys for validation without invoking setters.
+// Define own data properties so literal unsafe keys survive validation without invoking setters.
 function mergeFlatJob(
   nested: Record<string, unknown>,
   flat: Record<string, unknown>,
 ): Record<string, unknown> {
-  let job = { ...nested };
+  const job = { ...nested };
   for (const [key, value] of Object.entries(flat)) {
     const existing = Object.hasOwn(job, key) ? job[key] : undefined;
     if (existing === undefined) {
-      job = { ...job, [key]: value };
+      Object.defineProperty(job, key, {
+        value,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     } else if ((key === "schedule" || key === "payload") && isRecord(existing) && isRecord(value)) {
-      let merged = { ...existing };
+      const merged = { ...existing };
       for (const [field, entry] of Object.entries(value)) {
         if (
           Object.hasOwn(merged, field) &&
@@ -146,9 +151,14 @@ function mergeFlatJob(
         ) {
           throw new Error(`${field} is set twice; keep one.`);
         }
-        merged = { ...merged, [field]: entry };
+        Object.defineProperty(merged, field, {
+          value: entry,
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
       }
-      job = { ...job, [key]: merged };
+      job[key] = merged;
     } else if (!isDeepStrictEqual(existing, value)) {
       throw new Error(`${key} is set twice; keep one.`);
     }

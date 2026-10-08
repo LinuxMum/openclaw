@@ -249,6 +249,7 @@ describe("cron flat schema contract", () => {
       "limit",
       "mode",
       "offset",
+      "runId",
       "runMode",
       "sessionKey",
       "timeoutMs",
@@ -279,7 +280,6 @@ describe("cron flat schema contract", () => {
   });
 
   it("repairs a malformed flat call before provider schema validation", () => {
-    const tool = createCronTool();
     const raw = {
       action: "add",
       job: "truncated",

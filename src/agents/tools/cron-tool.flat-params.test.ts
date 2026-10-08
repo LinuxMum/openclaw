@@ -1,5 +1,6 @@
 import { validateToolArguments } from "@openclaw/llm-core/validation";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { isRecord } from "../../utils.js";
 import { getToolTerminalPresentation } from "../tool-terminal-presentation.js";
 import { createCronTool } from "./cron-tool.js";
 
@@ -11,6 +12,17 @@ const job = {
 };
 function execute(args: Record<string, unknown>) {
   return createCronTool(undefined, { callGatewayTool: gateway }).execute("cron", args);
+}
+function validatePrepared(tool: ReturnType<typeof createCronTool>, prepared: unknown) {
+  if (!isRecord(prepared)) {
+    throw new Error("Expected prepared cron arguments to be an object");
+  }
+  return validateToolArguments(tool, {
+    type: "toolCall",
+    id: "cron-boundary",
+    name: tool.name,
+    arguments: prepared,
+  });
 }
 function expectAdd(params: Record<string, unknown>) {
   expect(gateway).toHaveBeenCalledExactlyOnceWith(
@@ -871,7 +883,7 @@ describe("cron flat preparation boundary", () => {
     expect(prepared).toMatchObject({
       job: { payload: { kind: "agentTurn", message: "after" } },
     });
-    expect(validateToolArguments(tool, prepared)).toMatchObject({
+    expect(validatePrepared(tool, prepared)).toMatchObject({
       job: { payload: { kind: "agentTurn", message: "after" } },
     });
     expect(tool.prepareArguments?.(prepared)).toEqual(prepared);
@@ -879,8 +891,8 @@ describe("cron flat preparation boundary", () => {
 
   it.each([undefined, null, {}, [], "truncated"])(
     "rejects an unrecoverable update job (%j) before any Gateway call",
-    async (job) => {
-      await expect(execute({ action: "update", jobId: "job", job })).rejects.toThrow(
+    async (invalidJob) => {
+      await expect(execute({ action: "update", jobId: "job", job: invalidJob })).rejects.toThrow(
         "job required",
       );
       expect(gateway).not.toHaveBeenCalled();
@@ -902,12 +914,9 @@ describe("cron review regression boundaries", () => {
         toolsAllow: '["read"]',
         job: json ? JSON.stringify(nested) : nested,
       };
-      const tool = createCronTool(undefined, {
-        callGatewayTool: gateway,
-        creatorToolAllowlist: ["read"],
-      });
+      const tool = createCronTool({ creatorToolAllowlist: ["read"] }, { callGatewayTool: gateway });
       const prepared = tool.prepareArguments?.(args);
-      const validated = validateToolArguments(tool, prepared);
+      const validated = validatePrepared(tool, prepared);
       expect(tool.prepareArguments?.(validated)).toEqual(prepared);
       expect(nested).not.toHaveProperty("schedule.tz");
       expect(nested).not.toHaveProperty("payload.toolsAllow");
@@ -962,7 +971,7 @@ describe("cron review regression boundaries", () => {
       text: "stretch",
     });
     expect(prepared).toMatchObject({ job: { payload: { kind: "systemEvent", text: "stretch" } } });
-    expect(tool.prepareArguments?.(validateToolArguments(tool, prepared))).toEqual(prepared);
+    expect(tool.prepareArguments?.(validatePrepared(tool, prepared))).toEqual(prepared);
   });
 
   it.each(["agentTurn", "systemEvent"])(
@@ -976,7 +985,7 @@ describe("cron review regression boundaries", () => {
       const prepared = tool.prepareArguments?.({ action: "update", id: "job", text: "new" });
       expect(prepared).toMatchObject({ job: { payload: { text: "new" } } });
       expect(prepared).not.toHaveProperty("job.payload.kind");
-      const validated = validateToolArguments(tool, prepared);
+      const validated = validatePrepared(tool, prepared);
       expect(tool.prepareArguments?.(validated)).toEqual(prepared);
       await tool.execute("text-edit", validated);
       expect(gateway.mock.calls).toEqual([
@@ -1014,7 +1023,7 @@ describe("cron review regression boundaries", () => {
     };
     const prepared = tool.prepareArguments?.(args);
     expect(prepared).toMatchObject({ job: args.job });
-    expect(tool.prepareArguments?.(validateToolArguments(tool, prepared))).toEqual(prepared);
+    expect(tool.prepareArguments?.(validatePrepared(tool, prepared))).toEqual(prepared);
   });
 
   it("recovers text as the message of an explicit nested task without losing it", () => {
@@ -1026,7 +1035,7 @@ describe("cron review regression boundaries", () => {
     };
     const prepared = tool.prepareArguments?.(args);
     expect(prepared).toMatchObject({ job: { payload: { kind: "agentTurn", message: "new" } } });
-    expect(tool.prepareArguments?.(validateToolArguments(tool, prepared))).toEqual(prepared);
+    expect(tool.prepareArguments?.(validatePrepared(tool, prepared))).toEqual(prepared);
   });
 
   it("guides an unambiguous schedule-less task before any Gateway call", async () => {
