@@ -168,7 +168,9 @@ export function prepareCronToolArguments(args: unknown): Record<string, unknown>
       (key) => key !== "name" && Object.hasOwn(next, key),
     );
     if (mixed.length > 0) {
-      throw new Error(`Do not mix job with flat fields: ${mixed.join(", ")}. Retry with job only, or remove job and send all intended settings as flat fields.`);
+      throw new Error(
+        `Do not mix job with flat fields: ${mixed.join(", ")}. Retry with job only, or remove job and send all intended settings as flat fields.`,
+      );
     }
     return next;
   }

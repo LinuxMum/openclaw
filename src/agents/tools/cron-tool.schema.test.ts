@@ -260,9 +260,7 @@ describe("cron flat schema contract", () => {
     ]);
     expect(propertyAt(schemaRecord, "text")?.description).toMatch(/add.*update.*wake/i);
     expect(propertyAt(schemaRecord, "mode")?.description).toMatch(/wake.*only/i);
-    expect(createCronTool().description).toContain(
-      "Do not mix job with flat fields.",
-    );
+    expect(createCronTool().description).toContain("Do not mix job with flat fields.");
   });
 
   it("only advertises flat cron fields that the canonicalizer recovers", () => {

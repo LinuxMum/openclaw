@@ -347,7 +347,9 @@ function createCronFlatJobSchemaProperties() {
       Type.String({ description: 'Flat job name for action="add" or action="update"' }),
     ),
     enabled: Type.Optional(
-      Type.Boolean({ description: 'Set true to enable or false to disable; for action="add" or action="update"' }),
+      Type.Boolean({
+        description: 'Set true to enable or false to disable; for action="add" or action="update"',
+      }),
     ),
     sessionTarget: Type.Optional(
       Type.String({
@@ -357,7 +359,8 @@ function createCronFlatJobSchemaProperties() {
     ),
     at: Type.Optional(
       Type.String({
-        description: "Run once at this date/time, including UTC offset; for example, 2027-01-15T09:00:00+00:00",
+        description:
+          "Run once at this date/time, including UTC offset; for example, 2027-01-15T09:00:00+00:00",
       }),
     ),
     everyMs: optionalPositiveIntegerSchema({
@@ -369,7 +372,9 @@ function createCronFlatJobSchemaProperties() {
         description: "Flat wall-clock cron schedule for add/update (for example, 0 9 * * *)",
       }),
     ),
-    tz: Type.Optional(Type.String({ description: "Use only with expr; timezone name such as Europe/London" })),
+    tz: Type.Optional(
+      Type.String({ description: "Use only with expr; timezone name such as Europe/London" }),
+    ),
     message: Type.Optional(
       Type.String({
         description:

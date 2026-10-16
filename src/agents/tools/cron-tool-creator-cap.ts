@@ -405,7 +405,9 @@ export function planCronJobUpdatePatch(params: {
   const existingPayloadKind = readCronPayloadKind(existingPayload);
   const payloadKind = explicitPayloadKind ?? existingPayloadKind;
   if (payload && typeof payload.text === "string" && payloadKind === undefined) {
-    throw new Error("Cannot read whether the existing job is a reminder or task. No changes saved. Ask an administrator to inspect the existing job; do not recreate it.");
+    throw new Error(
+      "Cannot read whether the existing job is a reminder or task. No changes saved. Ask an administrator to inspect the existing job; do not recreate it.",
+    );
   }
   if (payload && payloadKind !== undefined) {
     // A kindless text edit inherits the stored kind instead of changing the job.
