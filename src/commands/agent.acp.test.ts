@@ -5,7 +5,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import "./agent-command.test-mocks.js";
 import * as acpManagerModule from "../acp/control-plane/manager.js";
 import { AcpRuntimeError } from "../acp/runtime/errors.js";
+import type * as AttemptExecutionHelpers from "../agents/command/attempt-execution.helpers.js";
 import { deliverAgentCommandResult } from "../agents/command/delivery.runtime.js";
+import { persistAcpTurnTranscript } from "../agents/command/transcript-persistence.js";
+import { getTranscriptMessageRole } from "../agents/embedded-agent-runner/message-visibility.js";
 import * as embeddedModule from "../agents/embedded-agent.js";
 import { readAgentRunTerminalOutcome } from "../channels/turn/agent-run-terminal-outcome.js";
 import * as configIoModule from "../config/io.js";
@@ -14,6 +17,10 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { withTempHomeCore as withTempHomeBase } from "../plugin-sdk/test-helpers/temp-home.js";
 import { parseAgentSessionKey } from "../routing/session-key.js";
 import type { RuntimeEnv } from "../runtime.js";
+import {
+  onInternalSessionTranscriptUpdate,
+  type InternalSessionTranscriptUpdate,
+} from "../sessions/transcript-events.js";
 import { agentCommand } from "./agent.js";
 import { createThrowingTestRuntime } from "./test-runtime-config-helpers.js";
 
@@ -49,10 +56,9 @@ const attemptExecutionMocks = vi.hoisted(() => ({
   emitAcpLifecycleError: vi.fn(),
   emitAcpPromptSubmitted: vi.fn(),
   emitAcpRuntimeEvent: vi.fn(),
-  persistAcpTurnTranscript: vi.fn(async ({ sessionEntry }: { sessionEntry?: unknown }) => ({
-    kind: "persisted",
-    sessionEntry,
-  })),
+  persistAcpTurnTranscript: vi.fn<
+    typeof import("../agents/command/transcript-persistence.js").persistAcpTurnTranscript
+  >(async ({ sessionEntry }) => ({ kind: "persisted", sessionEntry })),
 }));
 
 vi.mock("../infra/agent-events.js", () => agentEventMocks);
@@ -82,32 +88,15 @@ vi.mock("../agents/command/delivery.runtime.js", () => ({
   ),
 }));
 
+// mock-isolation: ACP command routing does not execute embedded or CLI attempts.
 vi.mock("../agents/command/attempt-execution.runtime.js", async () => {
-  const { buildAcpResult, resolveAcpLifecycleEndFields } = await vi.importActual<
-    typeof import("../agents/command/acp-lifecycle.js")
-  >("../agents/command/acp-lifecycle.js");
-  const createAcpVisibleTextAccumulator = () => {
-    let text = "";
-    let silent = false;
-    return {
-      consume(chunk: string) {
-        if (!chunk || chunk === "NO_REPLY") {
-          silent ||= chunk === "NO_REPLY";
-          return null;
-        }
-        text += chunk;
-        return { text, delta: chunk };
-      },
-      finalize: () => text.trim(),
-      finalizeRaw: () => text,
-      finalizeReplySnapshot: () =>
-        text
-          ? { disposition: "visible" as const, text }
-          : silent
-            ? { disposition: "silent" as const }
-            : { disposition: "empty" as const },
-    };
-  };
+  const { buildAcpResult, emitAcpAssistantDelta, resolveAcpLifecycleEndFields } =
+    await vi.importActual<typeof import("../agents/command/acp-lifecycle.js")>(
+      "../agents/command/acp-lifecycle.js",
+    );
+  const { createAcpVisibleTextAccumulator } = await vi.importActual<typeof AttemptExecutionHelpers>(
+    "../agents/command/attempt-execution.helpers.js",
+  );
 
   return {
     createAcpToolLifecycleTracker: () => ({
@@ -121,20 +110,7 @@ vi.mock("../agents/command/attempt-execution.runtime.js", async () => {
     emitAcpLifecycleError: attemptExecutionMocks.emitAcpLifecycleError,
     emitAcpPromptSubmitted: attemptExecutionMocks.emitAcpPromptSubmitted,
     emitAcpRuntimeEvent: attemptExecutionMocks.emitAcpRuntimeEvent,
-    emitAcpAssistantDelta: ({
-      runId,
-      text,
-      delta,
-    }: {
-      runId: string;
-      text: string;
-      delta: string;
-    }) =>
-      agentEventMocks.emitAgentEvent({
-        runId,
-        stream: "assistant",
-        data: { text, delta },
-      }),
+    emitAcpAssistantDelta,
     buildAcpResult,
     resolveAcpLifecycleEndFields,
     persistAcpTurnTranscript: attemptExecutionMocks.persistAcpTurnTranscript,
@@ -277,12 +253,13 @@ function createRunTurnFromTextDeltas(chunks: string[]) {
 }
 
 function subscribeAssistantEvents() {
-  const assistantEvents: Array<{ text?: string; delta?: string }> = [];
+  const assistantEvents: Array<{ text?: string; delta?: string; itemId?: string }> = [];
   const stop = agentEventMocks.onAgentEvent((evt) => {
     if (evt.stream !== "assistant") {
       return;
     }
     assistantEvents.push({
+      itemId: typeof evt.data?.itemId === "string" ? evt.data.itemId : undefined,
       text: typeof evt.data?.text === "string" ? evt.data.text : undefined,
       delta: typeof evt.data?.delta === "string" ? evt.data.delta : undefined,
     });
@@ -439,7 +416,7 @@ describe("agentCommand ACP runtime routing", () => {
             finalText: "  ACP reply\n",
           },
         );
-        expect(result?.payloads).toEqual([{ text: "ACP reply", mediaUrl: null }]);
+        expect(result?.payloads).toEqual([{ text: "  ACP reply", mediaUrl: null }]);
         expect(result?.meta.aborted).toBe(
           scenario.status === "cancelled" || ("abort" in scenario && scenario.abort !== "delivery"),
         );
@@ -468,13 +445,81 @@ describe("agentCommand ACP runtime routing", () => {
     },
   );
 
-  it("keeps no-reply ACP turns silent", async () => {
+  it("streams ACP visible text with the committed assistant occurrence identity", async () => {
     await withAcpSessionEnv(async () => {
-      const { assistantEvents, logLines } = await runAcpTurnWithAssistantEvents(["NO_REPLY"]);
+      const updates: InternalSessionTranscriptUpdate[] = [];
+      const unsubscribe = onInternalSessionTranscriptUpdate((event) => {
+        if (getTranscriptMessageRole(event.message) === "assistant") {
+          updates.push(event);
+        }
+      });
+      attemptExecutionMocks.persistAcpTurnTranscript.mockImplementationOnce(
+        persistAcpTurnTranscript,
+      );
+      try {
+        const repeated = await runAcpTurnWithAssistantEvents(["bo", "ok"]);
+        expect(updates).toHaveLength(1);
+        const committed = updates[0];
+        if (!committed?.target) {
+          throw new Error("Expected an inline committed ACP assistant");
+        }
+        expect(committed.runId).toEqual(expect.any(String));
+        expect(committed.message).toMatchObject({
+          idempotencyKey: committed.runId,
+          __openclaw: { runId: committed.runId },
+          content: [{ type: "text", text: "book" }],
+        });
+        expect(await loadTranscriptEvents(committed.target)).toContainEqual(
+          expect.objectContaining({ type: "message", message: committed.message }),
+        );
+        expect(repeated.assistantEvents).toEqual([
+          { itemId: committed.runId, text: "bo", delta: "bo" },
+          { itemId: committed.runId, text: "book", delta: "ok" },
+        ]);
+        expect(repeated.logLines.join("\n")).toContain("book");
+      } finally {
+        unsubscribe();
+      }
+    });
+  });
 
-      expect(assistantEvents.every((event) => !event.text)).toBe(true);
-      expect(logLines.join("\n")).not.toContain("NO_REPLY");
-      expect(logLines).toStrictEqual([]);
+  it.each(["", "NO_REPLY", " \tNO_REPLY\n"])(
+    "fails result-required ACP completion without delivering %j",
+    async (text) => {
+      await withAcpSessionEnv(async () => {
+        await expect(runAcpTurnWithAssistantEvents([text])).rejects.toMatchObject({
+          code: "ACP_TURN_FAILED",
+          message: expect.stringContaining("empty response"),
+        });
+        expect(deliverAgentCommandResult).not.toHaveBeenCalled();
+        expect(attemptExecutionMocks.emitAcpLifecycleError).toHaveBeenCalledWith(
+          expect.objectContaining({
+            terminalReply: { disposition: text ? "silent" : "empty" },
+          }),
+        );
+        expect(attemptExecutionMocks.persistAcpTurnTranscript).toHaveBeenCalledWith(
+          expect.objectContaining({ finalText: text }),
+        );
+      });
+    },
+  );
+
+  it.each([
+    "NO_REPLY.",
+    '"NO_REPLY"',
+    '{"action":"NO_REPLY"}',
+    "I will not reply.",
+    "NO_REPLY\nNO_REPLY",
+  ])("delivers ordinary ACP output %j", async (text) => {
+    await withAcpSessionEnv(async () => {
+      const { logLines } = await runAcpTurnWithAssistantEvents([text]);
+      const expected = text.startsWith("NO_REPLY\n") ? text.slice(9) : text;
+      expect(logLines).toContain(expected);
+      expect(attemptExecutionMocks.emitAcpLifecycleEnd).toHaveBeenCalledWith(
+        expect.objectContaining({
+          terminalReply: { disposition: "visible", text: expected },
+        }),
+      );
     });
   });
 

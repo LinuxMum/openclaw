@@ -1,8 +1,6 @@
-import { isDeepStrictEqual } from "node:util";
 import { normalizeCronJobPatch } from "../../cron/normalize.js";
 import { isRecord } from "../../utils.js";
 import {
-  canonicalizeCronToolObject,
   hasCronCreateSignal,
   isEmptyRecoveredCronPatch,
   recoverCronObjectFromFlatParams,
@@ -46,6 +44,21 @@ function normalizePayloadArrayHints(value: unknown): void {
 function hasNestedJob(value: unknown): value is Record<string, unknown> {
   return isRecord(value) && Object.keys(value).length > 0;
 }
+
+// Only meaningful advertised flat fields (except cosmetic name) are exclusive
+// with job. Main ignores unadvertised aliases beside a nested job.
+const ADVERTISED_FLAT_FIELDS = [
+  "at",
+  "everyMs",
+  "expr",
+  "tz",
+  "message",
+  "name",
+  "enabled",
+  "sessionTarget",
+  "toolsAllow",
+  "text",
+] as const;
 
 function rejectTopLevelMode(): never {
   throw new Error(
@@ -125,47 +138,6 @@ function assertUnambiguousPayload(job: Record<string, unknown>): void {
   }
 }
 
-// Merge only the two canonical subobjects; arrays and other values are atomic.
-// Define own data properties so literal unsafe keys survive validation without invoking setters.
-function mergeFlatJob(
-  nested: Record<string, unknown>,
-  flat: Record<string, unknown>,
-): Record<string, unknown> {
-  const job = { ...nested };
-  for (const [key, value] of Object.entries(flat)) {
-    const existing = Object.hasOwn(job, key) ? job[key] : undefined;
-    if (existing === undefined) {
-      Object.defineProperty(job, key, {
-        value,
-        enumerable: true,
-        writable: true,
-        configurable: true,
-      });
-    } else if ((key === "schedule" || key === "payload") && isRecord(existing) && isRecord(value)) {
-      const merged = { ...existing };
-      for (const [field, entry] of Object.entries(value)) {
-        if (
-          Object.hasOwn(merged, field) &&
-          merged[field] !== undefined &&
-          !isDeepStrictEqual(merged[field], entry)
-        ) {
-          throw new Error(`${field} is set twice; keep one.`);
-        }
-        Object.defineProperty(merged, field, {
-          value: entry,
-          enumerable: true,
-          writable: true,
-          configurable: true,
-        });
-      }
-      job[key] = merged;
-    } else if (!isDeepStrictEqual(existing, value)) {
-      throw new Error(`${key} is set twice; keep one.`);
-    }
-  }
-  return job;
-}
-
 /** Normalizes recoverable cron add/update arguments before provider schema validation. */
 export function prepareCronToolArguments(args: unknown): Record<string, unknown> {
   const next = isRecord(args) ? { ...args } : {};
@@ -182,11 +154,25 @@ export function prepareCronToolArguments(args: unknown): Record<string, unknown>
       // Weak models also send junk job strings; retain ordinary flat recovery.
     }
   }
-  const nestedJob = hasNestedJob(next.job) ? next.job : undefined;
-  const hasTopLevelMode = Object.hasOwn(next, "mode");
-  if (nestedJob && hasTopLevelMode) {
-    rejectTopLevelMode();
+  // Weak models emit blank strings as filler. They carry no information,
+  // including an empty timezone, and must not manufacture mixed input.
+  for (const key of ADVERTISED_FLAT_FIELDS) {
+    if (typeof next[key] === "string" && !next[key].trim()) {
+      delete next[key];
+    }
   }
+  // Nonempty nested jobs use the normal validation and normalization route.
+  // Flat recovery is only for missing, malformed, or empty job wrappers.
+  if (hasNestedJob(next.job)) {
+    const mixed = ADVERTISED_FLAT_FIELDS.filter(
+      (key) => key !== "name" && Object.hasOwn(next, key),
+    );
+    if (mixed.length > 0) {
+      throw new Error(`Do not mix job with flat fields: ${mixed.join(", ")}. Retry with job only, or remove job and send all intended settings as flat fields.`);
+    }
+    return next;
+  }
+  const hasTopLevelMode = Object.hasOwn(next, "mode");
 
   for (const key of ["toolsAllow", "fallbacks"] as const) {
     if (Object.hasOwn(next, key)) {
@@ -196,26 +182,6 @@ export function prepareCronToolArguments(args: unknown): Record<string, unknown>
 
   const recovered = recoverCronObjectFromFlatParams(next, next.action !== "update");
   normalizePayloadArrayHints(recovered.value.payload);
-  if (nestedJob) {
-    const job = canonicalizeCronToolObject(nestedJob, next.action !== "update");
-    normalizePayloadArrayHints(job.payload);
-    // A text alias can fill an explicit task prompt, but must not change its kind.
-    if (
-      isRecord(job.payload) &&
-      isRecord(recovered.value.payload) &&
-      job.payload.kind === "agentTurn" &&
-      recovered.value.payload.kind === "systemEvent" &&
-      next.kind === undefined &&
-      (!isRecord(next.payload) || next.payload.kind === undefined)
-    ) {
-      delete recovered.value.payload.kind;
-    }
-    const merged = mergeFlatJob(job, recovered.value);
-    assertUnambiguousPayload(merged);
-    assertFlatContractInvariants(next.action, next, merged);
-    next.job = merged;
-    return next;
-  }
 
   if (hasTopLevelMode) {
     const schedule = isRecord(recovered.value.schedule) ? recovered.value.schedule : undefined;
@@ -251,5 +217,10 @@ export function prepareCronToolArguments(args: unknown): Record<string, unknown>
     }
   }
   next.job = recovered.value;
+  // Preparation also runs at execute time. Do not reject our own recovered
+  // job as mixed input on the second pass through the preparation boundary.
+  for (const key of ADVERTISED_FLAT_FIELDS) {
+    delete next[key];
+  }
   return next;
 }

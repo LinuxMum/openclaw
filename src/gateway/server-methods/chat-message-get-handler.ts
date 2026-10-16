@@ -1,4 +1,5 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { GATEWAY_CLIENT_IDS } from "../../../packages/gateway-protocol/src/client-info.js";
 import { validateChatMessageGetParams } from "../../../packages/gateway-protocol/src/index.js";
 import { CHAT_PENDING_INPUT_MESSAGE_PREFIX } from "../../../packages/gateway-protocol/src/schema/chat-history-constants.js";
 import { getCliSessionBinding } from "../../config/sessions/cli-session-binding.js";
@@ -11,7 +12,7 @@ import {
 } from "../chat-display-projection.js";
 import { resolveCurrentUserProfileDisplay } from "../current-user-profile-display.js";
 import { projectOperatorModelRead } from "../operator-model-presentation.js";
-import { MAX_PAYLOAD_BYTES } from "../server-constants.js";
+import { MAX_PAYLOAD_BYTES } from "../payload-limits.js";
 import { withReadySessionRows } from "../session-row-prepared-read.js";
 import { resolveSessionModelRef } from "../session-utils.js";
 import { readChatHistoryMessageById } from "./chat-history-pages.js";
@@ -33,6 +34,7 @@ export const chatMessageGetHandlers: GatewayRequestHandlers = {
       return;
     }
     const { sessionKey, messageId, maxChars, sessionId: requestedSessionId } = params;
+    const includePluginSteering = client?.connect.client?.id === GATEWAY_CLIENT_IDS.CONTROL_UI;
     const agentIdOverride = normalizeOptionalString(params.agentId);
     const selection = await prepareChatHistorySessionRead({
       context,
@@ -60,6 +62,24 @@ export const chatMessageGetHandlers: GatewayRequestHandlers = {
           return readCurrentSharing(read) ? consume() : undefined;
         });
       const respondNotFound = () => respond(true, { ok: false, unavailableReason: "not_found" });
+      const respondMessage = (message: unknown, applyModelPolicy = false) => {
+        if (!message) {
+          respond(true, { ok: false, unavailableReason: "not_visible" });
+          return;
+        }
+        // maxChars bounds individual fields; structured content must also fit the transport.
+        respond(
+          true,
+          jsonUtf8Bytes(message) > MAX_PAYLOAD_BYTES - 1024
+            ? { ok: false, unavailableReason: "oversized" }
+            : applyModelPolicy
+              ? projectOperatorModelRead(
+                  { context, client, agentId: sessionAgentId },
+                  { ok: true, message },
+                )
+              : { ok: true, message },
+        );
+      };
       if (!sessionId) {
         await withCurrentSession(respondNotFound);
         return;
@@ -99,20 +119,12 @@ export const chatMessageGetHandlers: GatewayRequestHandlers = {
             undefined,
             resolveCronJobName,
           );
-          if (!message) {
-            respond(true, { ok: false, unavailableReason: "not_visible" });
-            return;
-          }
-          respond(
-            true,
-            jsonUtf8Bytes(message) > MAX_PAYLOAD_BYTES - 1024
-              ? { ok: false, unavailableReason: "oversized" }
-              : { ok: true, message },
-          );
+          respondMessage(message);
         });
         return;
       }
       const resolved = await readChatHistoryMessageById({
+        includePluginSteering,
         entry: historyEntry,
         provider: getCliSessionBinding(historyEntry, "claude-cli")?.sessionId
           ? resolveSessionModelRef(cfg, historyEntry, sessionAgentId, {
@@ -152,6 +164,7 @@ export const chatMessageGetHandlers: GatewayRequestHandlers = {
         const projectedMessage = resolved.message
           ? projectChatDisplayMessage(resolved.message, {
               includeCommentaryFallbacks: true,
+              includePluginSteering,
               maxChars: effectiveMaxChars,
               resolveCurrentUserProfileDisplay,
               resolveCronJobName,
@@ -160,22 +173,7 @@ export const chatMessageGetHandlers: GatewayRequestHandlers = {
         const projected = projectedMessage
           ? augmentChatHistoryWithCanvasBlocks([projectedMessage])[0]
           : undefined;
-        if (!projected) {
-          respond(true, { ok: false, unavailableReason: "not_visible" });
-          return;
-        }
-
-        // maxChars bounds individual text fields, not the serialized message: many
-        // blocks or structured output must not bypass the WebSocket payload limit.
-        respond(
-          true,
-          jsonUtf8Bytes(projected) > MAX_PAYLOAD_BYTES - 1024
-            ? { ok: false, unavailableReason: "oversized" }
-            : projectOperatorModelRead(
-                { context, client, agentId: sessionAgentId },
-                { ok: true, message: projected },
-              ),
-        );
+        respondMessage(projected, true);
       });
     } finally {
       selection.release();

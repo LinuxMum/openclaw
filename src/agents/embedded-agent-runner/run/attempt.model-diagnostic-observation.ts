@@ -1,4 +1,5 @@
 import type { ProviderAcceptance } from "@openclaw/ai/transports";
+import { asNonNegativeFiniteNumber } from "@openclaw/normalization-core/number-coercion";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import type {
@@ -10,7 +11,6 @@ import {
   type DiagnosticModelContentCapturePolicy,
 } from "../../../infra/diagnostic-llm-content.js";
 import { emitCoreSemanticRunProgressDiagnosticEvent } from "../../../infra/diagnostic-semantic-run-progress.js";
-import { createModelCallStreamProgressReporter } from "../../../logging/diagnostic-model-stream-progress.js";
 import { derivePromptTokens, normalizeUsage, type UsageLike } from "../../usage.js";
 
 export type ModelCallEventBase = Omit<
@@ -23,7 +23,7 @@ type ModelCallPromptStats = NonNullable<
 type ModelCallUsage = NonNullable<
   Extract<DiagnosticEventInput, { type: "model.call.completed" }>["usage"]
 >;
-export type ModelCallObservationState = {
+type ModelCallObservationState = {
   requestPayloadBytes?: number;
   providerAcceptanceKind?: ProviderAcceptance["kind"];
   responseStatus?: number;
@@ -32,6 +32,7 @@ export type ModelCallObservationState = {
   lastProviderActivityAtMs?: number;
   terminalReason?: "stop" | "length" | "toolUse" | "error" | "aborted";
   timeToFirstByteMs?: number;
+  providerProcessingMs?: number;
   modelContent?: DiagnosticModelCallContent;
   outputMessages?: unknown[];
   usage?: ModelCallUsage;
@@ -172,21 +173,6 @@ function streamContextModelPromptStats(
   };
 }
 
-function normalizedModelCallUsage(rawUsage: unknown): ModelCallUsage | undefined {
-  if (!isRecord(rawUsage)) {
-    return undefined;
-  }
-  const usage = normalizeUsage(rawUsage as UsageLike);
-  if (!usage) {
-    return undefined;
-  }
-  const promptTokens = derivePromptTokens(usage);
-  return {
-    ...usage,
-    ...(promptTokens !== undefined ? { promptTokens } : {}),
-  };
-}
-
 function observeModelCallTerminalMessage(state: ModelCallObservationState, value: unknown): void {
   if (!isRecord(value)) {
     return;
@@ -194,6 +180,14 @@ function observeModelCallTerminalMessage(state: ModelCallObservationState, value
   let rawUsage: unknown;
   try {
     rawUsage = value.usage;
+    const timing = Array.isArray(value.diagnostics)
+      ? value.diagnostics.findLast(
+          (entry: unknown) => isRecord(entry) && entry.type === "provider_timing",
+        )
+      : undefined;
+    if (isRecord(timing) && isRecord(timing.details)) {
+      state.providerProcessingMs = asNonNegativeFiniteNumber(timing.details.processingMs);
+    }
     const stopReason = value.stopReason;
     if (
       value.role === "assistant" &&
@@ -215,9 +209,10 @@ function observeModelCallTerminalMessage(state: ModelCallObservationState, value
   } catch {
     return;
   }
-  const usage = normalizedModelCallUsage(rawUsage);
+  const usage = isRecord(rawUsage) ? normalizeUsage(rawUsage as UsageLike) : undefined;
   if (usage) {
-    state.usage = usage;
+    const promptTokens = derivePromptTokens(usage);
+    state.usage = { ...usage, ...(promptTokens !== undefined ? { promptTokens } : {}) };
   }
 }
 
@@ -314,23 +309,6 @@ function isSemanticModelCallResult(result: unknown): boolean {
   }
 }
 
-function maybeEmitModelCallSemanticProgress(
-  eventBase: ModelCallEventBase,
-  state: ModelCallObservationState,
-  result: unknown,
-): void {
-  if (state.semanticProgressEmitted || !isSemanticModelCallResult(result)) {
-    return;
-  }
-  state.semanticProgressEmitted = true;
-  emitCoreSemanticRunProgressDiagnosticEvent({
-    runId: eventBase.runId,
-    ...(eventBase.sessionKey ? { sessionKey: eventBase.sessionKey } : {}),
-    ...(eventBase.sessionId ? { sessionId: eventBase.sessionId } : {}),
-    reason: MODEL_CALL_SEMANTIC_PROGRESS_REASON,
-  });
-}
-
 export function createModelObserver(params: {
   config?: OpenClawConfig;
   streamContext: unknown;
@@ -349,7 +327,6 @@ export function createModelObserver(params: {
     contentCapture: params.contentCapture,
     suppressPluginHooks: params.suppressPluginHooks,
   };
-  const reportStreamProgress = createModelCallStreamProgressReporter({ config: params.config });
   return {
     state,
     promptStats,
@@ -367,13 +344,15 @@ export function createModelObserver(params: {
       observeModelResponse(state, startedAt, result, "result");
       // Queue semantic progress beside model lifecycle events so request starts,
       // progress, and the next request retain their authoritative FIFO ordering.
-      maybeEmitModelCallSemanticProgress(eventBase, state, result);
-    },
-    maybeEmitStreamProgress(eventBase: ModelCallEventBase) {
-      reportStreamProgress({
-        ...eventBase,
-        callId: state.terminalEventEmitted ? undefined : eventBase.callId,
-      });
+      if (!state.semanticProgressEmitted && isSemanticModelCallResult(result)) {
+        state.semanticProgressEmitted = true;
+        emitCoreSemanticRunProgressDiagnosticEvent({
+          runId: eventBase.runId,
+          ...(eventBase.sessionKey ? { sessionKey: eventBase.sessionKey } : {}),
+          ...(eventBase.sessionId ? { sessionId: eventBase.sessionId } : {}),
+          reason: MODEL_CALL_SEMANTIC_PROGRESS_REASON,
+        });
+      }
     },
     sizeTimingFields() {
       return {

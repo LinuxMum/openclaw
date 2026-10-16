@@ -1,6 +1,7 @@
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { resolveAgentDir, resolveDefaultAgentId } from "../../agents/agent-scope.js";
+import { prepareAuthProfileProvider } from "../../agents/auth-profiles/store-runtime.js";
 import type { ModelCatalogEntry } from "../../agents/model-catalog.types.js";
 import { resolveModelRefFromString } from "../../agents/model-selection-shared.js";
 import { createModelVisibilityPolicy } from "../../agents/model-visibility-policy.js";
@@ -14,7 +15,7 @@ import {
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { applyModelOverrideWithAuthProfileCompatibility } from "../../sessions/auth-profile-preservation.js";
 import { ModelSelectionLockedError } from "../../sessions/model-overrides.js";
-import type { MsgContext, TemplateContext } from "../templating.js";
+import type { TemplateContext } from "../templating.js";
 import { isKnownModelSelectionProvider } from "./model-runtime-normalization.js";
 import {
   modelKey,
@@ -22,7 +23,7 @@ import {
   type ModelAliasIndex,
   type ModelDirectiveSelection,
 } from "./model-selection-directive.js";
-import type { ReplySessionEntryHandle } from "./session-entry-handle.js";
+import { publishReplySessionEntry, type ReplySessionEntryHandle } from "./session-entry-handle.js";
 
 export async function applyResetModelOverride(params: {
   cfg: OpenClawConfig;
@@ -32,7 +33,6 @@ export async function applyResetModelOverride(params: {
   resetTriggered: boolean;
   bodyStripped?: string;
   sessionCtx: TemplateContext;
-  ctx: MsgContext;
   sessionEntry?: SessionEntry;
   sessionEntryHandle?: ReplySessionEntryHandle;
   sessionStore?: Record<string, SessionEntry>;
@@ -152,6 +152,10 @@ export async function applyResetModelOverride(params: {
   if (!sessionEntry || !sessionKey) {
     return { selection, cleanedBody };
   }
+  const pinnedProfile = sessionEntry.authProfileOverride?.trim();
+  const recordedProvider = pinnedProfile
+    ? await prepareAuthProfileProvider({ agentDir, profileId: pinnedProfile })
+    : undefined;
   const initialSessionEntry = { ...sessionEntry };
   const nextSessionEntry = { ...sessionEntry };
   applyModelOverrideWithAuthProfileCompatibility({
@@ -164,6 +168,7 @@ export async function applyResetModelOverride(params: {
       params.defaultProvider,
     selection,
     explicitDefaultSelection: selection.isDefault,
+    recordedProvider,
   });
   let appliedEntry = nextSessionEntry;
   let selectionApplied = true;
@@ -191,10 +196,6 @@ export async function applyResetModelOverride(params: {
     });
   }
   adoptPersistedSessionSnapshot(sessionEntry, appliedEntry);
-  if (sessionEntryHandle) {
-    sessionEntryHandle.replaceCurrent(sessionEntry);
-  } else if (sessionStore) {
-    sessionStore[sessionKey] = sessionEntry;
-  }
+  publishReplySessionEntry({ sessionEntryHandle, sessionStore, sessionKey }, sessionEntry);
   return { selection: selectionApplied ? selection : undefined, cleanedBody };
 }

@@ -1,5 +1,6 @@
 import { validateToolArguments } from "@openclaw/llm-core/validation";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../../config/config.js";
 import { isRecord } from "../../utils.js";
 import { getToolTerminalPresentation } from "../tool-terminal-presentation.js";
 import { createCronTool } from "./cron-tool.js";
@@ -33,7 +34,12 @@ function expectAdd(params: Record<string, unknown>) {
 }
 
 beforeEach(() => {
+  setRuntimeConfigSnapshot({});
   gateway.mockReset().mockResolvedValue({ ok: true });
+});
+
+afterEach(() => {
+  clearRuntimeConfigSnapshot();
 });
 
 describe("cron shorthand recovery", () => {
@@ -56,14 +62,6 @@ describe("cron shorthand recovery", () => {
   });
 
   it.each([
-    {
-      name: "cron with timezone and stagger",
-      input: { cron: "0 18 * * *", tz: "Asia/Shanghai", staggerMs: 5000, message: "report" },
-      expected: {
-        schedule: { kind: "cron", expr: "0 18 * * *", tz: "Asia/Shanghai", staggerMs: 5000 },
-        payload: { kind: "agentTurn", message: "report" },
-      },
-    },
     {
       name: "script before agent-turn hints",
       input: {
@@ -93,7 +91,6 @@ describe("cron shorthand recovery", () => {
 
   it.each([
     { action: "add", kind: "on-exit", command: "pnpm build", cwd: "/repo", message: "rebuilt" },
-    { action: "update", jobId: "job", command: "make" },
   ])("rejects explicit or inferred on-exit shorthand on $action", async (args) => {
     await expect(execute(args)).rejects.toThrow(
       "automation on-exit schedules cannot be created or edited",
@@ -360,14 +357,10 @@ describe("cron flat preparation boundary", () => {
     const tool = createCronTool();
     const prepared = tool.prepareArguments?.({
       action: "add",
-      job: {
-        schedule: { kind: "every", everyMs: 60_000 },
-        payload: {
-          message: "Run the report",
-          toolsAllow: " read ",
-          fallbacks: " openai/gpt-5-mini ",
-        },
-      },
+      everyMs: 60_000,
+      message: "Run the report",
+      toolsAllow: " read ",
+      fallbacks: " openai/gpt-5-mini ",
     });
 
     expect(prepared).toMatchObject({
@@ -452,32 +445,6 @@ describe("cron flat preparation boundary", () => {
     expect(params.payload?.toolsAllow).toEqual([]);
   });
 
-  it("decodes JSON-encoded nested payload array hints instead of wrapping them", () => {
-    const tool = createCronTool();
-    const prepared = tool.prepareArguments?.({
-      action: "add",
-      job: {
-        schedule: { kind: "every", everyMs: 60_000 },
-        payload: {
-          message: "Run the report",
-          toolsAllow: ' ["read", "web_search"] ',
-          fallbacks: '["openai/gpt-5-mini"]',
-        },
-      },
-    });
-
-    expect(prepared).toMatchObject({
-      job: {
-        payload: {
-          kind: "agentTurn",
-          toolsAllow: ["read", "web_search"],
-          fallbacks: ["openai/gpt-5-mini"],
-        },
-      },
-    });
-    expect(tool.prepareArguments?.(prepared)).toEqual(prepared);
-  });
-
   it("decodes JSON-encoded flat array hints instead of wrapping them", () => {
     const tool = createCronTool();
     const prepared = tool.prepareArguments?.({
@@ -526,10 +493,9 @@ describe("cron flat preparation boundary", () => {
     const tool = createCronTool();
     const prepared = tool.prepareArguments?.({
       action: "add",
-      job: {
-        schedule: { kind: "every", everyMs: 60_000 },
-        payload: { message: "Run the report", toolsAllow: "[read" },
-      },
+      everyMs: 60_000,
+      message: "Run the report",
+      toolsAllow: "[read",
     }) as { job?: { payload?: { toolsAllow?: unknown } } };
 
     expect(prepared.job?.payload?.toolsAllow).toEqual(["[read"]);
@@ -548,7 +514,7 @@ describe("cron flat preparation boundary", () => {
     expect(prepared.job?.payload?.toolsAllow).toBe("");
   });
 
-  it("rejects non-stream top-level mode on add and update calls", async () => {
+  it("rejects non-stream top-level mode on flat add and update calls", () => {
     const tool = createCronTool(undefined, { callGatewayTool: callGatewayToolMock });
 
     for (const action of ["add", "update"] as const) {
@@ -566,28 +532,6 @@ describe("cron flat preparation boundary", () => {
       expect(() => tool.prepareArguments?.(args)).toThrow('"mode" is only valid for action="wake"');
     }
 
-    const nestedCalls = [
-      {
-        action: "add",
-        mode: "match",
-        job: {
-          schedule: { kind: "every", everyMs: 60_000 },
-          payload: { kind: "agentTurn", message: "Run the report" },
-        },
-      },
-      {
-        action: "update",
-        id: "job-1",
-        mode: "now",
-        job: { enabled: false },
-      },
-    ] as const;
-    for (const args of nestedCalls) {
-      expect(() => tool.prepareArguments?.(args)).toThrow('"mode" is only valid for action="wake"');
-      await expect(tool.execute(`call-nested-mode-${args.action}`, args)).rejects.toThrow(
-        '"mode" is only valid for action="wake"',
-      );
-    }
     expect(callGatewayToolMock).not.toHaveBeenCalled();
   });
 
@@ -735,13 +679,17 @@ describe("cron flat preparation boundary", () => {
     expect(callGatewayToolMock).not.toHaveBeenCalled();
   });
 
-  it("rejects flat tz without a cron expression on add", () => {
-    const tool = createCronTool();
-
-    expect(() =>
-      tool.prepareArguments?.({ action: "add", name: "TZ1", tz: "Europe/London", message: "x" }),
-    ).toThrow("tz needs expr. Put the offset in at, or drop tz.");
-  });
+  it.each(["UTC", "Europe/London"])(
+    "rejects flat tz %s without a cron expression before Gateway dispatch",
+    async (tz) => {
+      const tool = createCronTool(undefined, { callGatewayTool: callGatewayToolMock });
+      const args = { action: "add", tz, message: "test" };
+      const error = "tz needs expr. Put the offset in at, or drop tz.";
+      expect(() => tool.prepareArguments?.(args)).toThrow(error);
+      await expect(tool.execute("flat-tz-only", args)).rejects.toThrow(error);
+      expect(callGatewayToolMock).not.toHaveBeenCalled();
+    },
+  );
 
   it("accepts a cron schedule object with a top-level timezone on add", () => {
     const tool = createCronTool();
@@ -767,14 +715,6 @@ describe("cron flat preparation boundary", () => {
     }) as { job?: { schedule?: unknown } };
 
     expect(prepared.job?.schedule).toEqual({ kind: "cron", expr: "0 9 * * *", tz: "UTC" });
-  });
-
-  it("keeps rejecting a top-level timezone without a cron schedule on add", () => {
-    const tool = createCronTool();
-
-    expect(() => tool.prepareArguments?.({ action: "add", tz: "UTC", message: "test" })).toThrow(
-      "tz needs expr. Put the offset in at, or drop tz.",
-    );
   });
 
   it("rejects top-level timezone with a non-cron schedule on add", () => {
@@ -901,8 +841,215 @@ describe("cron flat preparation boundary", () => {
 });
 
 describe("cron review regression boundaries", () => {
+  it.each([
+    {
+      example: '{ "action":"add", "everyMs":300000, "message":"Check for urgent mail" }',
+      method: "cron.add",
+      expected: {
+        schedule: { kind: "every", everyMs: 300000 },
+        payload: { kind: "agentTurn", message: "Check for urgent mail" },
+      },
+    },
+    {
+      example:
+        '{ "action":"add", "expr":"0 9 * * *", "tz":"Europe/London", "text":"Take a break" }',
+      method: "cron.add",
+      expected: {
+        schedule: { kind: "cron", expr: "0 9 * * *", tz: "Europe/London" },
+        payload: { kind: "systemEvent", text: "Take a break" },
+      },
+    },
+    {
+      example: '{ "action":"update", "jobId":"existing-job-id", "enabled":false }',
+      method: "cron.update",
+      expected: { id: "existing-job-id", patch: { enabled: false } },
+    },
+  ])("executes the verbatim prompt example: $example", async ({ example, method, expected }) => {
+    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    expect(tool.description).toContain(example);
+    const prepared = tool.prepareArguments?.(JSON.parse(example));
+    const validated = validatePrepared(tool, prepared);
+    await tool.execute("prompt-example", validated);
+    expect(gateway).toHaveBeenCalledExactlyOnceWith(
+      method,
+      expect.anything(),
+      expect.objectContaining(expected),
+    );
+  });
+
+  it.each(["", "   "])("ignores blank flat fillers %j beside a nested job", async (blank) => {
+    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const args = {
+      action: "add",
+      job,
+      at: blank,
+      everyMs: blank,
+      expr: blank,
+      tz: blank,
+      message: blank,
+      name: blank,
+      enabled: blank,
+      sessionTarget: blank,
+      toolsAllow: blank,
+      text: blank,
+    };
+    const prepared = tool.prepareArguments?.(args);
+    expect(prepared).toEqual({ action: "add", job });
+    expect(args.tz).toBe(blank);
+    expect(tool.prepareArguments?.(prepared)).toEqual(prepared);
+    await tool.execute("nested-blank-fillers", validatePrepared(tool, prepared));
+    expectAdd({ schedule: job.schedule, payload: job.payload });
+  });
+
+  it("accepts a nested at reminder with a blank schedule timezone", async () => {
+    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const nested = {
+      name: "stretch",
+      sessionTarget: "main",
+      schedule: { kind: "at", at: "2026-11-01T09:00:00Z", tz: "" },
+      payload: { kind: "systemEvent", text: "stretch" },
+    };
+    const prepared = tool.prepareArguments?.({ action: "add", job: nested });
+    expect(prepared).toEqual({ action: "add", job: nested });
+    await tool.execute("nested-stretch-blank-tz", validatePrepared(tool, prepared));
+    expectAdd({
+      name: "stretch",
+      sessionTarget: "main",
+      schedule: { kind: "at", at: "2026-11-01T09:00:00.000Z" },
+      payload: { kind: "systemEvent", text: "stretch" },
+    });
+    expect(gateway.mock.calls[0]?.[2].schedule).not.toHaveProperty("tz");
+  });
+
+  it("continues ignoring cosmetic flat name beside a nested job", async () => {
+    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const args = { action: "add", name: "ignored flat name", job };
+    expect(tool.prepareArguments?.(args)).toEqual(args);
+    await tool.execute("nested-flat-name", validatePrepared(tool, args));
+    expectAdd({ name: job.name, schedule: job.schedule, payload: job.payload });
+  });
+
+  it.each(["add", "update"])(
+    "rejects an empty %s wrapper with no flat content before Gateway dispatch",
+    async (action) => {
+      const tool = createCronTool(undefined, { callGatewayTool: gateway });
+      const prepared = tool.prepareArguments?.({ action, id: "job", job: {} });
+      await expect(tool.execute("empty-wrapper", validatePrepared(tool, prepared))).rejects.toThrow(
+        "job required",
+      );
+      expect(gateway).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["add", "update"])("recovers flat content from an empty %s wrapper", async (action) => {
+    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const prepared = tool.prepareArguments?.({
+      action,
+      id: "job",
+      job: {},
+      ...(action === "add" ? { everyMs: 60_000, text: "stretch" } : { enabled: false }),
+    });
+    expect(prepared).not.toHaveProperty("everyMs");
+    expect(prepared).not.toHaveProperty("text");
+    expect(prepared).not.toHaveProperty("enabled");
+    const validated = validatePrepared(tool, prepared);
+    expect(tool.prepareArguments?.(validated)).toEqual(prepared);
+    await tool.execute("empty-flat-wrapper", validated);
+    expect(gateway).toHaveBeenCalledTimes(1);
+    if (action === "add") {
+      expectAdd({
+        schedule: { kind: "every", everyMs: 60_000 },
+        payload: { kind: "systemEvent", text: "stretch" },
+      });
+    } else {
+      expect(gateway).toHaveBeenCalledWith("cron.update", expect.anything(), {
+        id: "job",
+        patch: { enabled: false },
+      });
+    }
+  });
+
+  it("ignores top-level wake mode beside a nested update", async () => {
+    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const args = { action: "update", id: "job", mode: "now", job: { enabled: false } };
+    const prepared = tool.prepareArguments?.(args);
+    expect(prepared).toEqual(args);
+    await tool.execute("nested-mode", validatePrepared(tool, prepared));
+    expect(gateway).toHaveBeenCalledExactlyOnceWith("cron.update", expect.anything(), {
+      id: "job",
+      patch: { enabled: false },
+    });
+  });
+
+  it("continues ignoring unadvertised aliases beside a nested job", async () => {
+    const args = {
+      action: "add",
+      job,
+      cron: "0 1 * * *",
+      every: 123,
+      atMs: 123,
+      "payload.toolsAllow": ["write"],
+    };
+    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    expect(tool.prepareArguments?.(args)).toEqual(args);
+    await tool.execute("nested-aliases", args);
+    expectAdd({ schedule: job.schedule, payload: job.payload });
+  });
+
+  it.each(["", "   "])("treats blank flat tz %j as absent through execute", async (tz) => {
+    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const prepared = tool.prepareArguments?.({
+      action: "add",
+      at: "2026-11-01T09:00:00Z",
+      tz,
+      text: "stretch",
+    });
+    await tool.execute("blank-tz", validatePrepared(tool, prepared));
+    expectAdd({ schedule: { kind: "at", at: "2026-11-01T09:00:00.000Z" } });
+  });
+
+  it("normalizes stale nested at fields through the normal execute route", async () => {
+    // Same stale schedule shape as src/cron/normalize.test.ts:STALE_AT_SCHEDULE.
+    const schedule = {
+      kind: "at",
+      at: "2026-01-12T18:00:00Z",
+      expr: "* * * * *",
+      everyMs: 60_000,
+      anchorMs: 123,
+      tz: "UTC",
+      staggerMs: 30_000,
+    };
+    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const args = { action: "add", job: { ...job, schedule } };
+    expect(tool.prepareArguments?.(args)).toEqual(args);
+    await tool.execute("nested-stale-at", validatePrepared(tool, tool.prepareArguments?.(args)));
+    expectAdd({ schedule: { kind: "at", at: "2026-01-12T18:00:00.000Z" } });
+  });
+
+  it("leaves nested agentTurn leftover text to normal normalization", async () => {
+    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const args = {
+      action: "add",
+      job: { ...job, payload: { kind: "agentTurn", message: "work", text: "leftover" } },
+    };
+    expect(tool.prepareArguments?.(args)).toEqual(args);
+    await tool.execute("nested-leftover-text", validatePrepared(tool, tool.prepareArguments?.(args)));
+    expectAdd({ payload: { kind: "agentTurn", message: "work" } });
+  });
+
+  it("leaves nested reminder leftover message to normal normalization", async () => {
+    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const args = {
+      action: "add",
+      job: { ...job, payload: { kind: "systemEvent", text: "stretch", message: "leftover" } },
+    };
+    expect(tool.prepareArguments?.(args)).toEqual(args);
+    await tool.execute("nested-leftover-message", validatePrepared(tool, tool.prepareArguments?.(args)));
+    expectAdd({ payload: { kind: "systemEvent", text: "stretch" } });
+  });
+
   it.each([false, true])(
-    "merges timezone and tool restriction into nested job (JSON=%s)",
+    "rejects nested jobs with advertised flat timezone and restrictions (JSON=%s)",
     async (json) => {
       const nested = {
         schedule: { kind: "cron", expr: "0 9 * * *" },
@@ -914,36 +1061,36 @@ describe("cron review regression boundaries", () => {
         toolsAllow: '["read"]',
         job: json ? JSON.stringify(nested) : nested,
       };
-      const tool = createCronTool({ creatorToolAllowlist: ["read"] }, { callGatewayTool: gateway });
-      const prepared = tool.prepareArguments?.(args);
-      const validated = validatePrepared(tool, prepared);
-      expect(tool.prepareArguments?.(validated)).toEqual(prepared);
+      const tool = createCronTool(undefined, { callGatewayTool: gateway });
+      const error = "Do not mix job with flat fields: tz, toolsAllow. Retry with job only, or remove job and send all intended settings as flat fields.";
+      expect(() => tool.prepareArguments?.(args)).toThrow(error);
+      await expect(tool.execute("nested-flat", args)).rejects.toThrow(error);
       expect(nested).not.toHaveProperty("schedule.tz");
       expect(nested).not.toHaveProperty("payload.toolsAllow");
-      await tool.execute("nested-flat", validated);
-      expectAdd({
-        schedule: { kind: "cron", expr: "0 9 * * *", tz: "Europe/London" },
-        payload: expect.objectContaining({ toolsAllow: ["read"] }),
-      });
+      expect(gateway).not.toHaveBeenCalled();
     },
   );
 
   it.each([
-    { tz: "Europe/London", job: { ...job, schedule: { ...job.schedule, tz: "UTC" } }, field: "tz" },
-    {
-      toolsAllow: ["read"],
-      job: { ...job, payload: { ...job.payload, toolsAllow: ["write"] } },
-      field: "toolsAllow",
-    },
-  ])(
-    "rejects a conflicting nested/flat $field before any Gateway call",
-    async ({ field, ...args }) => {
-      await expect(execute({ action: "add", ...args })).rejects.toThrow(
-        `${field} is set twice; keep one.`,
-      );
-      expect(gateway).not.toHaveBeenCalled();
-    },
-  );
+    ["at", "2026-11-01T09:00:00Z"],
+    ["everyMs", 60_000],
+    ["expr", "0 12 * * *"],
+    ["tz", "UTC"],
+    ["message", "work"],
+    ["enabled", false],
+    ["sessionTarget", "isolated"],
+    ["toolsAllow", ["read"]],
+    ["text", "stretch"],
+  ] as const)("rejects advertised flat %s beside a nonempty job on add and update", async (field, value) => {
+    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    for (const action of ["add", "update"]) {
+      const args = { action, id: "job", job, [field]: value };
+      const error = `Do not mix job with flat fields: ${field}. Retry with job only, or remove job and send all intended settings as flat fields.`;
+      expect(() => tool.prepareArguments?.(args)).toThrow(error);
+      await expect(tool.execute("mixed-field", args)).rejects.toThrow(error);
+    }
+    expect(gateway).not.toHaveBeenCalled();
+  });
 
   it.each(["at", "every", "cron"])(
     "rejects an incomplete %s add before any Gateway call",
@@ -974,15 +1121,24 @@ describe("cron review regression boundaries", () => {
     expect(tool.prepareArguments?.(validatePrepared(tool, prepared))).toEqual(prepared);
   });
 
-  it.each(["agentTurn", "systemEvent"])(
-    "keeps stored %s kind for a text-only update",
-    async (kind) => {
+  it.each([
+    ["agentTurn", false],
+    ["systemEvent", false],
+    ["agentTurn", true],
+    ["systemEvent", true],
+  ] as const)(
+    "updates stored %s job end to end without changing kind (nested=%s)",
+    async (kind, nested) => {
       gateway.mockResolvedValueOnce({
         configRevision: "rev",
         payload: { kind, ...(kind === "agentTurn" ? { message: "old" } : { text: "old" }) },
       });
       const tool = createCronTool(undefined, { callGatewayTool: gateway });
-      const prepared = tool.prepareArguments?.({ action: "update", id: "job", text: "new" });
+      const prepared = tool.prepareArguments?.({
+        action: "update",
+        id: "job",
+        ...(nested ? { job: { payload: { text: "new" } } } : { text: "new" }),
+      });
       expect(prepared).toMatchObject({ job: { payload: { text: "new" } } });
       expect(prepared).not.toHaveProperty("job.payload.kind");
       const validated = validatePrepared(tool, prepared);
@@ -1005,37 +1161,42 @@ describe("cron review regression boundaries", () => {
     },
   );
 
-  it("rejects unreadable stored payload kind without a write", async () => {
-    gateway.mockResolvedValueOnce({ configRevision: "rev", payload: {} });
-    await expect(execute({ action: "update", id: "job", text: "new" })).rejects.toThrow(
-      "Cannot read the stored job type; retry after fixing the job.",
-    );
-    expect(gateway).toHaveBeenCalledExactlyOnceWith("cron.get", expect.anything(), { id: "job" });
+  it.each([false, true])(
+    "rejects unreadable stored payload kind without a write (nested=%s)",
+    async (nested) => {
+      gateway.mockResolvedValueOnce({ configRevision: "rev", payload: {} });
+      await expect(
+        execute({
+          action: "update",
+          id: "job",
+          ...(nested ? { job: { payload: { text: "new" } } } : { text: "new" }),
+        }),
+      ).rejects.toThrow("Cannot read whether the existing job is a reminder or task. No changes saved. Ask an administrator to inspect the existing job; do not recreate it.");
+      expect(gateway).toHaveBeenCalledExactlyOnceWith("cron.get", expect.anything(), { id: "job" });
+    },
+  );
+
+  it("rejects identical nested/flat timezone and restrictions", async () => {
+    await expect(
+      execute({
+        action: "add",
+        tz: "UTC",
+        toolsAllow: ["read"],
+        job: { ...job, payload: { ...job.payload, toolsAllow: ["read"] } },
+      }),
+    ).rejects.toThrow("Do not mix job with flat fields: tz, toolsAllow. Retry with job only, or remove job and send all intended settings as flat fields.");
+    expect(gateway).not.toHaveBeenCalled();
   });
 
-  it("accepts identical nested/flat timezone and restrictions idempotently", () => {
-    const tool = createCronTool();
-    const args = {
-      action: "add",
-      tz: "UTC",
-      toolsAllow: ["read"],
-      job: { ...job, payload: { ...job.payload, toolsAllow: ["read"] } },
-    };
-    const prepared = tool.prepareArguments?.(args);
-    expect(prepared).toMatchObject({ job: args.job });
-    expect(tool.prepareArguments?.(validatePrepared(tool, prepared))).toEqual(prepared);
-  });
-
-  it("recovers text as the message of an explicit nested task without losing it", () => {
-    const tool = createCronTool();
-    const args = {
-      action: "add",
-      text: "new",
-      job: { schedule: job.schedule, payload: { kind: "agentTurn" } },
-    };
-    const prepared = tool.prepareArguments?.(args);
-    expect(prepared).toMatchObject({ job: { payload: { kind: "agentTurn", message: "new" } } });
-    expect(tool.prepareArguments?.(validatePrepared(tool, prepared))).toEqual(prepared);
+  it("rejects top-level text beside an explicit nested task", async () => {
+    await expect(
+      execute({
+        action: "add",
+        text: "new",
+        job: { schedule: job.schedule, payload: { kind: "agentTurn" } },
+      }),
+    ).rejects.toThrow("Do not mix job with flat fields: text. Retry with job only, or remove job and send all intended settings as flat fields.");
+    expect(gateway).not.toHaveBeenCalled();
   });
 
   it("guides an unambiguous schedule-less task before any Gateway call", async () => {
@@ -1050,9 +1211,69 @@ describe("cron review regression boundaries", () => {
     async (kind) => {
       gateway.mockResolvedValueOnce({ configRevision: "rev", payload: { kind } });
       await expect(execute({ action: "update", id: "job", text: "new" })).rejects.toThrow(
-        "text edits need a reminder or task job.",
+        "Use text only to edit a reminder or task job.",
       );
       expect(gateway).toHaveBeenCalledExactlyOnceWith("cron.get", expect.anything(), { id: "job" });
     },
   );
+});
+
+describe("cron schedule updates", () => {
+  it("preserves the timezone for flat expressions without leaking scheduleKind", async () => {
+    gateway.mockResolvedValueOnce({
+      id: "job-kind",
+      configRevision: "sha256:test",
+      schedule: { kind: "cron", expr: "0 7 * * *", tz: "Asia/Shanghai" },
+    });
+    await execute({
+      action: "update",
+      id: "job-kind",
+      expr: "0 8 * * *",
+      scheduleKind: "cron",
+    });
+    expect(gateway.mock.calls).toEqual([
+      ["cron.get", expect.anything(), { id: "job-kind" }],
+      [
+        "cron.update",
+        expect.anything(),
+        {
+          id: "job-kind",
+          expectedConfigRevision: "sha256:test",
+          patch: { schedule: { expr: "0 8 * * *", kind: "cron", tz: "Asia/Shanghai" } },
+        },
+      ],
+    ]);
+  });
+
+  it.each([
+    { schedule: { kind: "cron", expr: "0 8 * * *", tz: "Europe/Paris" } },
+    { schedule: { kind: "every", everyMs: 60_000 } },
+    { name: "renamed" },
+  ])(
+    "updates explicit timezones and unrelated fields without reading the job: %j",
+    async (patch) => {
+      await execute({ action: "update", id: "job-fast-path", job: patch });
+      expect(gateway).toHaveBeenCalledExactlyOnceWith("cron.update", expect.anything(), {
+        id: "job-fast-path",
+        patch,
+      });
+    },
+  );
+
+  it.each([
+    { kind: "cron", expr: "0 7 * * *" },
+    { kind: "every", everyMs: 60_000 },
+  ])("does not invent a timezone when the stored schedule has none: %j", async (schedule) => {
+    gateway.mockResolvedValueOnce({ id: "job-no-tz", configRevision: "sha256:test", schedule });
+    const patch = { schedule: { kind: "cron", expr: "0 8 * * *" } };
+    await execute({ action: "update", id: "job-no-tz", job: patch });
+    expect(gateway.mock.calls).toEqual([
+      ["cron.get", expect.anything(), { id: "job-no-tz" }],
+      [
+        "cron.update",
+        expect.anything(),
+        { id: "job-no-tz", expectedConfigRevision: "sha256:test", patch },
+      ],
+    ]);
+  });
 });

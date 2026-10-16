@@ -55,7 +55,7 @@ Delivery is at least once across the queue-to-agent boundary: a Gateway shutdown
 crash during an active delivery can replay the turn. Message events deduplicate by
 LINE message ID. Other event types use `webhookEventId`. Retained completion records
 suppress ordinary duplicate webhooks, but handlers that perform external side effects
-should still be idempotent.
+should still avoid duplicating their effects when retried.
 If you need a custom path, set `channels.line.webhookPath` or
 `channels.line.accounts.<id>.webhookPath` and update the URL accordingly.
 
@@ -120,7 +120,7 @@ LINE-specific settings:
   event is acknowledged without a second dispatch. Once it is gone — by age or by
   cap — a redelivery is admitted and dispatched again, so handlers with external
   side effects should not treat this window as a substitute for their own
-  idempotency.
+  duplicate prevention.
 
 The `500`-on-persistence-failure contract only helps if LINE re-sends the event.
 LINE redelivers a webhook when **Webhook redelivery** is enabled for the channel in
@@ -404,7 +404,11 @@ Each select keeps its prompt and any overflow options together in that text.
 Prompts and overflow option names remain complete. Only native quick-reply button
 labels are shortened to LINE's 20-character limit.
 
-In direct chats, the options an `ask_user` question offers become tappable controls
+LINE does not expose OpenClaw's built-in [`ask_user`](/tools/ask-user) tool.
+The agent asks in ordinary messages instead. Native agent runtimes can have
+their own question tools, whose behavior is separate from this availability rule.
+
+In direct chats, the options in a runtime-authored question become tappable controls
 on the same Flex card, and a tap answers the question directly. LINE carries the option
 index the Gateway assigned rather than the label, so a reply whose choices the Gateway no longer
 lists falls back to readable text instead of drawing a tap that answers the wrong
@@ -539,7 +543,7 @@ link-local, and private-network targets.
 
 ## Troubleshooting
 
-- **Webhook verification fails:** ensure the webhook URL is HTTPS and the
+- **Webhook verification fails:** check that the webhook URL is HTTPS and the
   `channelSecret` matches the LINE console.
 - **No inbound events:** run `openclaw channels status --probe`. LINE only delivers
   events while the channel's webhook URL is registered and **Use webhook** is on in

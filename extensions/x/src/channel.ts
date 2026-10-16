@@ -13,6 +13,7 @@ import {
 import { normalizeXUserId } from "./allowlist.js";
 import { XConfigSchema } from "./config-schema.js";
 import { resolveXGuestToolPolicy, resolveXSenderTier } from "./guest-policy.js";
+import { readXReplyOutcome, xReplyOutcomeGuidance } from "./outcome.js";
 import { getXRuntime } from "./runtime.js";
 import { channelSecrets } from "./secret-contract.js";
 import type { sendXDelivery } from "./send.js";
@@ -77,7 +78,11 @@ export const xPlugin: ChannelPlugin<ResolvedXAccount> = {
     messageToolHints: () => [senderGuidance],
     inboundFormattingHints: () => ({
       text_markup: "plain_text",
-      rules: [senderGuidance, "Replies are public plain text; documentation URLs may be cited."],
+      rules: [
+        senderGuidance,
+        "Replies are public plain text; documentation URLs may be cited.",
+        xReplyOutcomeGuidance,
+      ],
     }),
   },
   groups: {
@@ -122,17 +127,30 @@ export const xPlugin: ChannelPlugin<ResolvedXAccount> = {
         : null,
     supportsAction: ({ action }) => action === "send",
     extractToolSend: ({ args }) => extractToolSend(args, "sendMessage"),
-    handleAction: async ({ action, params, cfg, accountId, assertDirectAdapterHandoff }) => {
+    handleAction: async ({
+      action,
+      params,
+      cfg,
+      accountId,
+      sessionKey,
+      assertDirectAdapterHandoff,
+    }) => {
       if (action !== "send") {
         throw new Error(`X does not support ${action}.`);
+      }
+      // Message-tool posts are explicit sends; they only refuse declared failures.
+      const reply = readXReplyOutcome(readStringParam(params, "message", { required: true }));
+      if (reply.outcome === "failure") {
+        throw new Error("X does not post failure replies; report the failure in this session.");
       }
       const result = await send({
         cfg,
         accountId,
         to: readStringParam(params, "to", { required: true }),
-        text: readStringParam(params, "message", { required: true }),
+        text: reply.text,
         mediaUrl: readStringParam(params, "media"),
         assertDirectAdapterHandoff,
+        sessionKey,
       });
       return jsonResult({ ok: true, messageId: result.messageId });
     },
@@ -167,6 +185,9 @@ export const xPlugin: ChannelPlugin<ResolvedXAccount> = {
       configured: account.configured,
       dmPolicy: "disabled",
       guests: await (await import("./guests.js")).getXGuestStatus(getXRuntime(), account, cfg),
+      verifiedFromGitHub: await (
+        await import("./verified-github.js")
+      ).getXGitHubStatus(getXRuntime(), account),
     }),
   },
   gateway: { startAccount: async (ctx) => (await import("./monitor.js")).startXAccount(ctx) },

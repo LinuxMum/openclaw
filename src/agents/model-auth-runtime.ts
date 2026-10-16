@@ -12,7 +12,12 @@ import { mintSecretSentinel } from "../secrets/sentinel.js";
 import type { AuthProfileStore } from "./auth-profiles.js";
 import { resolveProviderEnvAuthLookupMaps } from "./model-auth-env-vars.js";
 import { resolveEnvApiKey, type EnvApiKeyLookupOptions } from "./model-auth-env.js";
-import { CUSTOM_LOCAL_AUTH_MARKER, isNonSecretApiKeyMarker } from "./model-auth-markers.js";
+import {
+  CUSTOM_LOCAL_AUTH_MARKER,
+  isNonSecretApiKeyMarker,
+  isSecretRefHeaderValueMarker,
+  resolveExplicitProviderNoAuth,
+} from "./model-auth-markers.js";
 import { isAuthModeAllowedForModel } from "./model-auth-policy.js";
 import * as authConfig from "./model-auth-provider-config.js";
 import { resolveManagedSecretRefRuntimeProviderAuth } from "./model-auth-runtime-config.js";
@@ -146,6 +151,9 @@ function resolveRuntimeAvailableProviderAuth<T>(
   if (authOverride === "aws-sdk") {
     return true;
   }
+  if (authOverride === "none") {
+    return authConfig.hasSyntheticLocalProviderAuthConfig({ ...params, cfg: params.cfg, provider });
+  }
 
   // Callers that supply the auth store get inline provider keys hidden while
   // their billing/auth cooldown is active, so browse and tool selection stop
@@ -267,7 +275,7 @@ type SyntheticProviderAuthParams = {
 
 type ResolveSyntheticProviderAuth = (
   config: OpenClawConfig | undefined,
-) => ResolvedProviderAuth | undefined;
+) => ReturnType<typeof resolveProviderSyntheticAuthWithPlugin>;
 
 function syntheticAuthLookup(
   params: SyntheticProviderAuthParams,
@@ -287,11 +295,33 @@ function syntheticAuthLookup(
   };
 }
 
+/** A managed process owns auth only when its provider supplies a non-secret credential. */
+export function resolveManagedLocalProviderAuth(
+  params: SyntheticProviderAuthParams,
+  resolveFromConfig: ResolveSyntheticProviderAuth = (config) =>
+    resolveProviderSyntheticAuthWithPlugin(syntheticAuthLookup(params, config)),
+): ResolvedProviderAuth | undefined {
+  if (!resolveMergedModelProviderConfig(params.cfg, params.provider)?.localService) {
+    return undefined;
+  }
+  const auth = resolveFromConfig(params.cfg);
+  return auth?.mode === "api-key" &&
+    !auth.nativeAuth &&
+    isNonSecretApiKeyMarker(auth.apiKey, { includeEnvVarName: false }) &&
+    !isSecretRefHeaderValueMarker(auth.apiKey)
+    ? auth
+    : undefined;
+}
+
 function resolveProviderSyntheticRuntimeAuth(
   params: SyntheticProviderAuthParams,
   resolveFromConfig: ResolveSyntheticProviderAuth = (config) =>
     resolveProviderSyntheticAuthWithPlugin(syntheticAuthLookup(params, config)),
 ): SyntheticProviderAuthResolution {
+  const managedLocalAuth = resolveManagedLocalProviderAuth(params, resolveFromConfig);
+  if (managedLocalAuth) {
+    return { auth: managedLocalAuth };
+  }
   const runtimeAuth = resolveManagedSecretRefRuntimeProviderAuth(params);
   if (runtimeAuth) {
     return { auth: runtimeAuth };
@@ -334,6 +364,14 @@ function resolveProviderSyntheticRuntimeAuth(
 export async function prepareSyntheticLocalProviderAuth(
   params: SyntheticProviderAuthParams & { signal?: AbortSignal },
 ): Promise<ResolvedProviderAuth | null> {
+  const noAuth = resolveExplicitProviderNoAuth({
+    provider: params.provider,
+    providerConfig: resolveMergedModelProviderConfig(params.cfg, params.provider),
+    modelApi: params.modelApi,
+  });
+  if (noAuth) {
+    return noAuth;
+  }
   if (
     params.allowPluginSyntheticAuth === false ||
     authConfig.hasSecretRefProviderApiKey(params.cfg, params.provider)

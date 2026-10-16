@@ -61,12 +61,12 @@ export interface SubagentLifecycleCommonContext {
 }
 
 export interface SubagentLifecycleCompletionContext extends SubagentLifecycleCommonContext {
+  resumeAncestorCleanup(settledEntry: SubagentRunRecord): void;
   readonly progressEndedEntries: WeakSet<object>;
   acquireTerminalCompletionLock(runId: string): Promise<() => void>;
   bindTerminalSessionEffects(entry: SubagentRunRecord, effects?: SubagentSessionEffects): void;
   bumpCleanupGeneration(entry: SubagentRunRecord): number;
-  bumpTerminalGeneration(entry: SubagentRunRecord, bindingChanged?: boolean): number;
-  isTerminalCallbackCurrent(entry: SubagentRunRecord, generation: number): boolean;
+  isTerminalExecutionCurrent(entry: SubagentRunRecord): boolean;
   startSubagentAnnounceCleanupFlow(entry: SubagentRunRecord): boolean;
 }
 
@@ -104,15 +104,11 @@ export type PendingRequesterSettleWakeCommit = {
   initialTransfer?: {
     kind: "intent" | "yielded-cohort" | "completed-cohort";
     completion: Promise<void>;
-    published: boolean;
     completed: boolean;
-    blocked: boolean;
-    retire(): void;
   };
   stateContext?: OpenClawStateWorkerContext;
   ownsRetirement(entry: SubagentRunRecord): boolean;
   adoptPublished(entries: readonly SubagentRunRecord[]): readonly SubagentRunRecord[];
-  retryWholeBatch: boolean;
   inFlight?: Promise<void>;
   failures: number;
   nextAttemptAt: number;
@@ -130,6 +126,10 @@ export interface SubagentLifecycleWakeContext extends SubagentLifecycleCommonCon
   readonly scheduledRequesterSettleWakeTimers: Map<string, ScheduledRequesterSettleWake>;
   readonly scheduledRequesterSettleWakeRuns: Set<object>;
   readonly pendingRequesterSettleWakeRearms: Set<object>;
+  readonly waitingRequesterSettleWakeRuns: WeakMap<
+    object,
+    { rearmGeneration?: number; deadline?: number }
+  >;
   readonly cancelledRequesterSettleWakeRuns: Set<object>;
   readonly pendingRequesterSettleWakeCommits: Map<object, PendingRequesterSettleWakeCommit>;
   resumeAncestorCleanup(settledEntry: SubagentRunRecord): void;
@@ -151,7 +151,7 @@ export type CleanupBookkeepingParams = {
   provisionalKill?: boolean;
   skipRequesterSettleWake?: boolean;
   isCurrent?: () => boolean;
-  discardDelivery?: (draft: SubagentRunRecord) => void;
+  finalizeDelivery?: (draft: SubagentRunRecord) => void;
 };
 
 export type ScheduledRequesterSettleWake = {

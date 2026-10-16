@@ -39,7 +39,7 @@ import { resolveTextChunkLimit, type GetReplyOptions } from "openclaw/plugin-sdk
 import { resolveInboundLastRouteSessionKey } from "openclaw/plugin-sdk/routing";
 import {
   createRuntimeConfigReader,
-  getRuntimeConfig,
+  captureRuntimeConfigAsyncReader,
 } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import {
   createNonExitingRuntime,
@@ -56,24 +56,18 @@ import {
 } from "openclaw/plugin-sdk/runtime-group-policy";
 import { resolvePinnedMainDmOwnerFromAllowlist } from "openclaw/plugin-sdk/security-runtime";
 import {
-  getSessionEntry,
+  getSessionEntryAsync,
   readSessionUpdatedAtAsync,
   resolveSendPolicy,
   resolveStorePath,
 } from "openclaw/plugin-sdk/session-store-runtime";
 import { normalizeStringEntries } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { sliceUtf16Safe, truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { waitForTransportReady } from "openclaw/plugin-sdk/transport-ready-runtime";
 import { resolveIMessageAccount } from "../accounts.js";
-import { iMessageApprovalControlBindings } from "../approval-control-binding-window.js";
 import type { IMessageApprovalGatewayRuntime } from "../approval-gateway-types.js";
 import { maybeResolveIMessageApprovalPollVote } from "../approval-polls.js";
 import { pollPendingIMessageApprovalReactions } from "../approval-reaction-poller.js";
 import { maybeResolveIMessageApprovalReaction } from "../approval-reactions.js";
-import {
-  buildIMessageApprovalConversationKeyForInbound,
-  resolveIMessageApprovalControlActor,
-} from "../approval-target-keys.js";
 import { resolveIMessageDirectChatService } from "../chat-context.js";
 import { resolveIMessageStartupRowidWatermark } from "../chat-db.js";
 import { markIMessageChatRead, sendIMessageTyping } from "../chat.js";
@@ -85,10 +79,6 @@ import {
   resolveIMessageRemoteAttachmentRoots,
 } from "../media-contract.js";
 import { imessageRpcSupportsMethod, probeIMessage, probeIMessagePrivateApi } from "../probe.js";
-import {
-  hasIMessageQuestionReactionTarget,
-  maybeResolveIMessageQuestionReaction,
-} from "../question-reactions.js";
 import { resolveIMessageRemoteHost } from "../remote-host.js";
 import { sendMessageIMessage } from "../send.js";
 import { normalizeIMessageHandle } from "../targets.js";
@@ -202,7 +192,7 @@ const IMESSAGE_THROTTLED_DIAGNOSTIC_DROP_REASONS = new Set(["from me", "no menti
 export async function monitorIMessageProvider(opts: MonitorIMessageOpts): Promise<void> {
   const { scheduler } = opts;
   const runtime = opts.runtime ?? createNonExitingRuntime();
-  const cfg = opts.config ?? getRuntimeConfig();
+  const cfg = opts.config ?? (await captureRuntimeConfigAsyncReader()());
   const readConfig = createRuntimeConfigReader(cfg);
   const accountInfo = resolveIMessageAccount({
     cfg,
@@ -429,11 +419,8 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts): Promis
                 ? expectDefined(entries[0], "single iMessage dispatch entry").message
                 : combineIMessagePayloads(entries.map((entry) => entry.message));
             if (entries.length > 1 && shouldLogVerbose()) {
-              const text = combined.text ?? "";
-              const preview = sliceUtf16Safe(text, 0, 50);
-              const ellipsis = text.length > 50 ? "..." : "";
               logVerbose(
-                `[imessage] merged ${entries.length} debounced messages: "${preview}${ellipsis}"`,
+                `[imessage] merged ${entries.length} debounced messages chars=${combined.text?.length ?? 0}`,
               );
             }
             await handleMessageNow(combined, admissionLifecycle);
@@ -599,11 +586,6 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts): Promis
       process.env,
       accountInfo.accountId,
     ).catch(() => []);
-    const isQuestionReaction = hasIMessageQuestionReactionTarget({
-      accountId: accountInfo.accountId,
-      message,
-      bodyText,
-    });
     const decision = await resolveIMessageInboundDecision({
       cfg,
       accountId: accountInfo.accountId,
@@ -622,7 +604,7 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts): Promis
       groupHistories,
       echoCache: sentMessageCache,
       selfChatCache,
-      reactionNotifications: isQuestionReaction ? "all" : imessageCfg.reactionNotifications,
+      reactionNotifications: imessageCfg.reactionNotifications,
       logVerbose,
     });
 
@@ -727,18 +709,6 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts): Promis
     }
 
     if (decision.kind === "reaction") {
-      if (
-        await maybeResolveIMessageQuestionReaction({
-          cfg,
-          accountId: accountInfo.accountId,
-          message,
-          bodyText,
-          senderId: decision.senderNormalized,
-          logDebug: logVerbose,
-        })
-      ) {
-        return;
-      }
       enqueueIMessageReactionSystemEvent({ decision, runtime, logVerbose });
       return;
     }
@@ -773,7 +743,7 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts): Promis
       cfg.agents?.defaults?.typingMode;
     const sendPolicy = resolveSendPolicy({
       cfg,
-      entry: getSessionEntry({ storePath, sessionKey: decision.route.sessionKey }),
+      entry: await getSessionEntryAsync({ storePath, sessionKey: decision.route.sessionKey }),
       sessionKey: decision.route.sessionKey,
       channel: "imessage",
       chatType: decision.isGroup ? "group" : "direct",
@@ -888,11 +858,10 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts): Promis
       normalizeEntry: normalizeIMessageHandle,
     });
     if (shouldLogVerbose()) {
-      const preview = truncateUtf16Safe(ctxPayload.Body ?? "", 200).replace(/\n/g, "\\n");
       logVerbose(
         `imessage inbound: chatId=${chatId ?? "unknown"} from=${ctxPayload.From} len=${
           (ctxPayload.Body ?? "").length
-        } preview="${preview}"`,
+        }`,
       );
     }
 
@@ -1133,17 +1102,10 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts): Promis
     });
   };
 
-  const resolveApprovalControlConversation = (message: IMessagePayload) => {
-    const actorHandle = resolveIMessageApprovalControlActor(message);
-    return actorHandle
-      ? buildIMessageApprovalConversationKeyForInbound(message, actorHandle)
-      : null;
-  };
-
   const ingress = createIMessageDurableIngress({
     accountId: accountInfo.accountId,
     runtime,
-    dispatchPriority: async (message, lifecycle, receivedAt, provenance) => {
+    dispatchPriority: async (message, _lifecycle, receivedAt, provenance) => {
       const bodyText = (message.text ?? "").trim();
       const isApprovalCommand = /^\/approve(?:@[^\s]+)?(?:\s|$)/i.test(bodyText);
       const isCandidate =
@@ -1166,27 +1128,9 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts): Promis
         await handleMessageNow(repairedMessage);
         return { kind: "completed" };
       }
-      const conversation = resolveApprovalControlConversation(repairedMessage);
-      while (true) {
-        if (await maybeHandleApprovalControl(repairedMessage)) {
-          return { kind: "completed" };
-        }
-        if (!conversation) {
-          return undefined;
-        }
-        const waited = await iMessageApprovalControlBindings.wait({
-          accountId: accountInfo.accountId,
-          conversation,
-          abortSignal: lifecycle.abortSignal,
-        });
-        if (!waited) {
-          // The binding may have completed between the ownership check and
-          // window lookup. Close that check-then-wait race before queueing.
-          return (await maybeHandleApprovalControl(repairedMessage))
-            ? { kind: "completed" }
-            : undefined;
-        }
-      }
+      return (await maybeHandleApprovalControl(repairedMessage))
+        ? { kind: "completed" }
+        : undefined;
     },
     dispatch: async (message, ingressLifecycle, receivedAt, provenance) => {
       // Recovery rows get the wider age fence; explicit catchup uses its own age window.

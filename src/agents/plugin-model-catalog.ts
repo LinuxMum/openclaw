@@ -22,6 +22,7 @@ import {
   resolveAuthProfileDatabaseOwnerId,
   resolveAuthProfileDatabasePath,
 } from "./auth-profiles/sqlite.js";
+import { MODELS_JSON_STATE } from "./models-config-state.js";
 import type { PluginModelCatalogAuthSnapshot } from "./plugin-model-catalog-auth.js";
 import {
   withPluginModelCatalogPublicationLocks,
@@ -90,15 +91,16 @@ export function loadPersistedPluginModelCatalogsReadOnly(
 export function repairPersistedPluginModelCatalogs(params: {
   agentDir: string;
   catalogs: readonly PersistedPluginModelCatalog[];
-}): Array<{ pluginId: string; removedModelCount: number }> {
+}): Array<{ pluginId: string; removedModelCount: number; completedCostModelCount: number }> {
   const repairs = params.catalogs.flatMap((catalog) => {
     const repaired = repairPluginModelCatalogTransportMetadata(catalog.contents);
-    return repaired.removedModelCount > 0
+    return repaired.contents !== catalog.contents
       ? [
           {
             ...catalog,
             repairedContents: repaired.contents,
             removedModelCount: repaired.removedModelCount,
+            completedCostModelCount: repaired.completedCostModelCount,
           },
         ]
       : [];
@@ -129,7 +131,11 @@ export function repairPersistedPluginModelCatalogs(params: {
     pluginModelCatalogDatabaseOptions(params.agentDir),
     { operationLabel: "plugin-model-catalog.repair" },
   );
-  return applied.map(({ pluginId, removedModelCount }) => ({ pluginId, removedModelCount }));
+  return applied.map(({ pluginId, removedModelCount, completedCostModelCount }) => ({
+    pluginId,
+    removedModelCount,
+    completedCostModelCount,
+  }));
 }
 
 function readPersistedPluginModelCatalogMigrationPayloads(
@@ -573,6 +579,40 @@ export async function replacePersistedPluginModelCatalogs(params: {
   );
 }
 
+/** Removes only cached endpoints known to belong to a just-removed config entry. */
+export async function pruneRemovedProviderPluginModelCatalogs(params: {
+  agentDir: string;
+  removedProviderBaseUrls: Readonly<Record<string, string>>;
+}): Promise<boolean> {
+  if (Object.keys(params.removedProviderBaseUrls).length === 0) {
+    return false;
+  }
+  // Discovery plans hold this queue through publication; prune after older plans settle.
+  return await MODELS_JSON_STATE.writeQueue.enqueue(
+    path.join(params.agentDir, "models.json"),
+    async () => {
+      const options = pluginModelCatalogDatabaseOptions(params.agentDir);
+      options.path = resolvePathViaExistingAncestorSync(options.path);
+      try {
+        await stat(options.path);
+      } catch (error) {
+        if (hasErrnoCode(error, "ENOENT")) {
+          return false;
+        }
+        throw error;
+      }
+      return await withPluginModelCatalogPublicationLocks([options.path], () =>
+        withPluginModelCatalogWorker(options, false, (scope) =>
+          scope.execute({
+            type: "catalog.pruneRemovedProviders",
+            input: { removedProviderBaseUrls: { ...params.removedProviderBaseUrls } },
+          }),
+        ),
+      );
+    },
+  );
+}
+
 export type PluginModelCatalogMetadataSnapshot = Pick<PluginMetadataSnapshot, "owners"> & {
   manifestRegistry?: Pick<PluginMetadataSnapshot["manifestRegistry"], "plugins">;
   index?: {
@@ -589,29 +629,21 @@ export function encodePluginModelCatalogRelativePath(pluginId: string): string {
   return `plugins/${encodeURIComponent(pluginId)}/${PLUGIN_MODEL_CATALOG_FILE}`;
 }
 
-/** Returns true only for canonical profile-relative generated catalog paths. */
-function isPluginModelCatalogRelativePath(relativePath: string): boolean {
-  const parts = relativePath.split(/[\\/]/);
-  return (
-    !path.isAbsolute(relativePath) &&
-    parts.length === 3 &&
-    parts[0] === "plugins" &&
-    parts[1] !== "" &&
-    parts[1] !== "." &&
-    parts[1] !== ".." &&
-    parts[2] === PLUGIN_MODEL_CATALOG_FILE
-  );
-}
-
 /** Decodes the plugin id from a canonical generated catalog path. */
 export function decodePluginModelCatalogRelativePathPluginId(
   relativePath: string,
 ): string | undefined {
-  if (!isPluginModelCatalogRelativePath(relativePath)) {
-    return undefined;
-  }
-  const encodedPluginId = relativePath.split(/[\\/]/)[1];
-  if (!encodedPluginId) {
+  const parts = relativePath.split(/[\\/]/);
+  const encodedPluginId = parts[1];
+  if (
+    path.isAbsolute(relativePath) ||
+    parts.length !== 3 ||
+    parts[0] !== "plugins" ||
+    !encodedPluginId ||
+    encodedPluginId === "." ||
+    encodedPluginId === ".." ||
+    parts[2] !== PLUGIN_MODEL_CATALOG_FILE
+  ) {
     return undefined;
   }
   try {

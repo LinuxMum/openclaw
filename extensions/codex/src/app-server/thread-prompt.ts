@@ -28,6 +28,8 @@ export type CodexThreadPromptContext = Pick<
   | "disableTools"
   | "disableMessageTool"
   | "delegationCapability"
+  | "pluginHarnessToolPolicyRestricted"
+  | "requireWorkspaceOnly"
   | "toolsAllow"
   | "sourceReplyDeliveryMode"
   | "promptMode"
@@ -83,6 +85,8 @@ export function buildDeveloperInstructions(
     !isMessageOnlyCodexSourceReply(params);
   const nativeDelegationAvailable =
     delegationGuidanceAvailable &&
+    params.pluginHarnessToolPolicyRestricted !== true &&
+    params.requireWorkspaceOnly !== true &&
     !isCodexResponsesOAuthRun(params) &&
     !isSystemAgentOnlyCodexDynamicToolAllowlist(params.toolsAllow) &&
     !shouldDisableCodexToolSearchForModel(params.modelId);
@@ -130,6 +134,8 @@ export function buildDeveloperInstructions(
           hasSessionsYield,
           hasSubagentsList: toolNames.has("subagents"),
           hasSessionsSend: toolNames.has("sessions_send"),
+          sessionsCreateToolName: toolNames.get("sessions_create"),
+          suggestTaskToolName: toolNames.get("suggest_task"),
         }).join("\n")
       : undefined,
     params.disableTools !== true && params.promptMode !== "minimal" && params.promptMode !== "none"
@@ -149,5 +155,5 @@ export function buildDeveloperInstructions(
     params.gitCoauthorPrompt,
     params.extraSystemPrompt,
   ];
-  return sections.filter((section) => typeof section === "string" && section.trim()).join("\n\n");
+  return sections.filter((section) => section?.trim()).join("\n\n");
 }

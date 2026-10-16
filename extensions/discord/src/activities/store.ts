@@ -92,26 +92,12 @@ async function applyActivityStoreIntent<T>(
   }
 }
 
-function pendingLaunchForWidget(
-  existing: DiscordActivityPendingLaunch | undefined,
-  widgetId: string,
-  createdAt: number,
-): DiscordActivityPendingLaunch {
-  return existing && (existing.state === "ambiguous" || existing.widgetId !== widgetId)
-    ? { state: "ambiguous", createdAt }
-    : { state: "single", widgetId, createdAt };
-}
-
 export class DiscordActivityStore {
-  private lastWidgetCreatedAt = 0;
-
   constructor(private readonly stores: DiscordActivityStores) {}
 
   async createWidget(value: DiscordActivityWidget): Promise<string> {
     const id = randomBytes(16).toString("base64url");
-    const createdAt = Math.max(value.createdAt, this.lastWidgetCreatedAt + 1);
-    this.lastWidgetCreatedAt = createdAt;
-    await this.stores.widgets.register(id, { ...value, createdAt, deliveredMessageId: null });
+    await this.stores.widgets.register(id, { ...value, deliveredMessageId: null });
     return id;
   }
 
@@ -204,7 +190,9 @@ export class DiscordActivityStore {
     await applyActivityStoreIntent(this.stores.launches, key, (existing) => ({
       operation: "update",
       action: "set",
-      value: pendingLaunchForWidget(existing, widgetId, createdAt),
+      value: (existing && (existing.state === "ambiguous" || existing.widgetId !== widgetId)
+        ? { state: "ambiguous", createdAt }
+        : { state: "single", widgetId, createdAt }) satisfies DiscordActivityPendingLaunch,
     }));
   }
 

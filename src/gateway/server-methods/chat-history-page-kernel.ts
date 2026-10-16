@@ -87,6 +87,8 @@ export async function readChatHistoryPageKernel(
     sessionKey: canonicalKey,
     storePath,
   };
+  const attachReplyMessages = (messages: unknown[]) =>
+    attachChatHistoryReplyMessages(augmentChatHistoryWithCanvasBlocks(messages), params, options);
   const readSequence = options.readMessageSequence ?? readChatHistoryMessageSeq;
   if (messageId) {
     const direction = pageCursor?.direction;
@@ -151,9 +153,11 @@ export async function readChatHistoryPageKernel(
     );
     const project = (messages: unknown[]) =>
       projectChatDisplayMessagesWithState(messages, {
+        includePluginSteering: params.includePluginSteering,
         subagentCoordination: options.readers.subagentCoordination,
         includeCommentaryFallbacks: true,
         maxChars: effectiveMaxChars,
+        toolResultMaxChars: params.toolResultMaxChars,
         resolveCronJobName: options.resolveCronJobName,
         ...(options.deferProfileDisplay
           ? {}
@@ -197,11 +201,7 @@ export async function readChatHistoryPageKernel(
     );
     const oldestSeq = readSequence(cursorMessages[0]);
     return {
-      messages: await attachChatHistoryReplyMessages(
-        augmentChatHistoryWithCanvasBlocks(projected),
-        params,
-        options,
-      ),
+      messages: await attachReplyMessages(projected),
       ...(projection.activity.length ? { activity: projection.activity } : {}),
       ...(source
         ? {
@@ -224,6 +224,8 @@ export async function readChatHistoryPageKernel(
     readScope,
     effectiveMaxChars,
     max,
+    toolResultMaxChars: params.toolResultMaxChars,
+    includePluginSteering: params.includePluginSteering,
     maxBytes: maxHistoryBytes,
     isPageFull: (projection) =>
       prepareChatHistoryResponsePage(projection, params, options.readMessageSequence).omission
@@ -247,11 +249,7 @@ export async function readChatHistoryPageKernel(
     !incrementalTail.projection.assistantErrorPending
       ? { deltaCursor: readPage.deltaCursor }
       : {}),
-    messages: await attachChatHistoryReplyMessages(
-      augmentChatHistoryWithCanvasBlocks(incrementalTail.projected),
-      params,
-      options,
-    ),
+    messages: await attachReplyMessages(incrementalTail.projected),
     ...(incrementalTail.projection.activity.length
       ? { activity: incrementalTail.projection.activity }
       : {}),

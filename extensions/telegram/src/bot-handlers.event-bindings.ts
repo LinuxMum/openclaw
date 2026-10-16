@@ -271,16 +271,10 @@ export function createTelegramEventBindings({
           ? [user.first_name, user.last_name].filter(Boolean).join(" ").trim() || user.username
           : undefined;
         const senderUsernameLabel = user?.username ? `@${user.username}` : undefined;
-        let senderLabel = senderName;
-        if (senderName && senderUsernameLabel) {
-          senderLabel = `${senderName} (${senderUsernameLabel})`;
-        } else if (!senderName && senderUsernameLabel) {
-          senderLabel = senderUsernameLabel;
-        }
-        if (!senderLabel && user?.id) {
-          senderLabel = `id:${user.id}`;
-        }
-        senderLabel = senderLabel || "unknown";
+        const senderLabel =
+          (senderName && senderUsernameLabel
+            ? `${senderName} (${senderUsernameLabel})`
+            : senderName || senderUsernameLabel) || (user?.id ? `id:${user.id}` : "unknown");
 
         for (const addedReaction of addedReactions) {
           const emoji = addedReaction.emoji;
@@ -288,13 +282,26 @@ export function createTelegramEventBindings({
           telegramDeps.enqueueRoutedSystemEvent(text, route, {
             contextKey: `telegram:reaction:add:${chatId}:${messageId}:${user?.id ?? "anon"}:${emoji}`,
           });
-          logVerbose(`telegram: reaction event enqueued: ${text}`);
+          logVerbose(`telegram: reaction event enqueued chat=${chatId} message=${messageId}`);
         }
       } catch (err) {
         runtime.error?.(danger(`telegram reaction handler failed: ${String(err)}`));
         throw err;
       }
     });
+  };
+
+  const handlePollError = (
+    err: unknown,
+    ctx: { update: unknown },
+    kind: "poll" | "poll_answer",
+  ) => {
+    runtime.error?.(danger(`telegram ${kind} handler failed: ${String(err)}`));
+    if (isTelegramSpooledReplayUpdate(ctx.update)) {
+      recordTelegramMessageProcessingResult({ kind: "failed-retryable", error: err });
+    } else {
+      throw err;
+    }
   };
 
   const registerPolls = () => {
@@ -306,12 +313,7 @@ export function createTelegramEventBindings({
         }
         await retireTelegramPollRegistryEntry({ accountId, pollId: poll.id });
       } catch (err) {
-        runtime.error?.(danger(`telegram poll handler failed: ${String(err)}`));
-        if (isTelegramSpooledReplayUpdate(ctx.update)) {
-          recordTelegramMessageProcessingResult({ kind: "failed-retryable", error: err });
-          return;
-        }
-        throw err;
+        handlePollError(err, ctx, "poll");
       }
     });
 
@@ -412,12 +414,7 @@ export function createTelegramEventBindings({
         recordTelegramMessageProcessingResult(result);
         logVerbose(`telegram: poll_answer dispatched for poll ${pollId} by ${senderId}`);
       } catch (err) {
-        runtime.error?.(danger(`telegram poll_answer handler failed: ${String(err)}`));
-        if (isTelegramSpooledReplayUpdate(ctx.update)) {
-          recordTelegramMessageProcessingResult({ kind: "failed-retryable", error: err });
-          return;
-        }
-        throw err;
+        handlePollError(err, ctx, "poll_answer");
       }
     });
   };

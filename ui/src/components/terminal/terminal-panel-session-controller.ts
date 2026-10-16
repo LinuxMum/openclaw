@@ -12,7 +12,10 @@ import {
 } from "./terminal-connection.ts";
 import { disposeTerminalController } from "./terminal-controller-lifecycle.ts";
 import { terminalOpenErrorText } from "./terminal-panel-chrome.ts";
-import { bootTerminalPanelSession } from "./terminal-panel-session-boot.ts";
+import {
+  bootTerminalPanelSession,
+  observeTerminalRestoreInput,
+} from "./terminal-panel-session-boot.ts";
 import { focusTerminalSession } from "./terminal-panel-session-rendering.ts";
 import {
   resolveTerminalPanelOwnerSessionKey,
@@ -23,6 +26,7 @@ import {
   type TerminalPanelSessionControllerHost,
   type TerminalPanelSessionControllerState,
   type TerminalPanelSessionTab,
+  type TerminalRestoreBatch,
 } from "./terminal-panel-session-types.ts";
 import { TerminalIntentQueue, terminalIntentQueue } from "./terminal-pending-actions.ts";
 import type { TerminalIntentHost } from "./terminal-pending-actions.ts";
@@ -32,13 +36,6 @@ import {
 } from "./terminal-session-storage.ts";
 import { TerminalTabReadinessController } from "./terminal-tab-readiness.ts";
 import { TerminalTaskQueue } from "./terminal-task-queue.ts";
-
-type TerminalRestoreBatch = {
-  operation: TerminalOperation;
-  pending: Map<string, TerminalPanelSessionTab | undefined>;
-  userClosedTab: boolean;
-  cancelIntent?: () => void;
-};
 
 /** Owns gateway PTY sessions and the Ghostty controllers bound to them. */
 export class TerminalPanelSessionController implements TerminalPanelSessionControllerState {
@@ -195,7 +192,7 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
   scheduleLifecycleSync(): void {
     const token = ++this.lifecycleSyncToken;
     const generation = this.lifecycleGeneration;
-    // State teardown inside Lit's updated hook schedules a nested update.
+    // State teardown during the render commit can schedule a nested update.
     // Defer it; token + generation reject superseded connection epochs.
     queueMicrotask(() => {
       if (
@@ -276,6 +273,7 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
       operation,
       pending: new Map(persisted.map((sessionId) => [sessionId, undefined])),
       userClosedTab: false,
+      input: observeTerminalRestoreInput(this.host.ownerDocument, operation.signal),
       cancelIntent,
     };
     this.pendingRestore = restore;
@@ -307,6 +305,7 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
     } catch {
       // A failed restore falls through to a fresh session below.
     } finally {
+      restore.input.stop();
       if (this.isTerminalOperationCurrent(operation, restore)) {
         this.pendingRestore = null;
         this.updateControllerState({ booting: false });
@@ -373,12 +372,14 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
       restore?: { batch: TerminalRestoreBatch; sessionId: string };
     } = {},
   ) {
+    const restore = options.restore?.batch;
     const boot = await bootTerminalPanelSession({
       panel: this.host,
       connection: this.connectionFor(operation),
       sequence: ++this.tabSequence,
       awaitFirstOutput: options.awaitFirstOutput === true,
-      isCurrent: () => this.isTerminalOperationCurrent(operation, options.restore?.batch),
+      isCurrent: () => this.isTerminalOperationCurrent(operation, restore),
+      shouldFocusOnOpen: restore && (() => !restore.input.interacted),
       onReady: (tab) => this.readiness.markReady(tab),
       onExit: (tab, info) => this.handleExit(tab.id, info),
     });
@@ -390,7 +391,8 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
     // without making an unadopted gatewaySessionId usable by input or resize.
     options.restore?.batch.pending.set(options.restore.sessionId, boot.tab);
     boot.tab.cancelPendingIntent = operation.cancelIntent;
-    this.updateControllerState({ tabs: [...this.tabs, boot.tab], activeId: boot.tab.id });
+    const activeId = restore?.input.interacted ? (this.activeId ?? boot.tab.id) : boot.tab.id;
+    this.updateControllerState({ tabs: [...this.tabs, boot.tab], activeId });
     return boot;
   }
 
@@ -478,10 +480,7 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
         // The server session is live and its sink registered; close it now or
         // it survives invisibly (eating the session cap) until disconnect.
         void boot.connection.close(result.sessionId);
-        if (this.tabs.includes(boot.tab)) {
-          boot.tab.cancelled = "lifecycle";
-          this.removeTab(boot.tab);
-        }
+        this.discardCancelledTab(boot.tab);
         return cancelledByUser;
       }
       this.adoptSession(boot.tab, result, ownerSessionKey !== undefined);
@@ -546,10 +545,7 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
         if (boot.tab.cancelled === "close") {
           void boot.connection.close(result.sessionId);
         }
-        if (this.tabs.includes(boot.tab)) {
-          boot.tab.cancelled = "lifecycle";
-          this.removeTab(boot.tab);
-        }
+        this.discardCancelledTab(boot.tab);
         return false;
       }
       this.adoptSession(boot.tab, result, agentOwned);
@@ -592,13 +588,17 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
       restore: { batch: restore, sessionId },
     });
     if (!this.isTerminalOperationCurrent(restore.operation, restore) || boot.tab.cancelled) {
-      if (this.tabs.includes(boot.tab)) {
-        boot.tab.cancelled = "lifecycle";
-        this.removeTab(boot.tab);
-      }
+      this.discardCancelledTab(boot.tab);
       return;
     }
     this.markRestoredSessionExited(boot.tab, sessionId);
+  }
+
+  private discardCancelledTab(tab: TerminalPanelSessionTab): void {
+    if (this.tabs.includes(tab)) {
+      tab.cancelled = "lifecycle";
+      this.removeTab(tab);
+    }
   }
 
   private markRestoredSessionExited(tab: TerminalPanelSessionTab, sessionId: string): void {

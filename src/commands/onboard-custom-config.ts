@@ -8,6 +8,7 @@ import { CONTEXT_WINDOW_HARD_MIN_TOKENS } from "../agents/context-window-guard.j
 import { DEFAULT_PROVIDER } from "../agents/defaults.js";
 import { normalizeConfiguredProviderCatalogModelId } from "../agents/model-ref-shared.js";
 import { buildModelAliasIndex, modelKey, type ModelRef } from "../agents/model-selection.js";
+import type { ModelApi } from "../config/types.models.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { isSecretRef, type SecretInput } from "../config/types.secrets.js";
 import type { PluginManifestRecord } from "../plugins/manifest-registry.js";
@@ -60,19 +61,13 @@ export function resolveCustomModelImageInputInference(
     /\b(?:qwen[\w.-]*-?vl|qwen-vl)\b/.test(normalized) ||
     /\b(?:vision|llava|pixtral|internvl|mllama|minicpm-v|glm-4v)\b/.test(normalized) ||
     /(?:^|[-_/])vl(?:[-_/]|$)/.test(normalized);
-  if (matchesKnownVision) {
-    return { supportsImageInput: true, confidence: "known" };
-  }
-
-  const matchesKnownText =
+  const knownModel =
+    matchesKnownVision ||
     /\b(?:llama\d*|deepseek|mistral|mixtral|kimi|moonshot|codestral|devstral|phi|qwq|codellama)\b/.test(
       normalized,
-    ) || /\bqwen(?!.*(?:vl|vision))/.test(normalized);
-  if (matchesKnownText) {
-    return { supportsImageInput: false, confidence: "known" };
-  }
-
-  return { supportsImageInput: false, confidence: "unknown" };
+    ) ||
+    /\bqwen(?!.*(?:vl|vision))/.test(normalized);
+  return { supportsImageInput: matchesKnownVision, confidence: knownModel ? "known" : "unknown" };
 }
 
 function isAzureUrl(baseUrl: string, openAiOnly = false): boolean {
@@ -117,6 +112,23 @@ function hasSameHost(a: string, b: string): boolean {
 
 export type CustomApiCompatibility = "openai" | "openai-responses" | "anthropic";
 
+export function resolveCustomProviderApi(params: {
+  baseUrl: string;
+  compatibility: CustomApiCompatibility;
+  modelApi?: ModelApi;
+}): ModelApi {
+  return (
+    params.modelApi ??
+    (isAzureUrl(params.baseUrl, true)
+      ? "azure-openai-responses"
+      : params.compatibility === "anthropic"
+        ? "anthropic-messages"
+        : params.compatibility === "openai-responses"
+          ? "openai-responses"
+          : "openai-completions")
+  );
+}
+
 export type CustomApiResult = ReturnType<typeof applyCustomApiConfig>;
 
 type ApplyCustomApiConfigParams = {
@@ -125,6 +137,8 @@ type ApplyCustomApiConfigParams = {
   modelId: string;
   compatibility: CustomApiCompatibility;
   apiKey?: SecretInput;
+  /** Explicitly mark the endpoint as not enforcing auth (`auth: "none"`). */
+  noAuth?: boolean;
   providerId?: string;
   alias?: string;
   supportsImageInput?: boolean;
@@ -138,6 +152,7 @@ type ParseNonInteractiveCustomApiFlagsParams = {
   modelId?: string;
   compatibility?: string;
   apiKey?: string;
+  noAuth?: boolean;
   providerId?: string;
   supportsImageInput?: boolean;
 };
@@ -148,7 +163,9 @@ type CustomApiErrorCode =
   | "invalid_base_url"
   | "invalid_model_id"
   | "invalid_provider_id"
-  | "invalid_alias";
+  | "invalid_alias"
+  | "no_auth_conflict"
+  | "no_auth_unsupported";
 
 /** Error class used by callers to turn custom API validation failures into CLI UX. */
 export class CustomApiError extends Error {
@@ -276,38 +293,29 @@ export function buildOpenAiVerificationProbeRequest(params: {
       ? { "api-key": params.apiKey }
       : { Authorization: `Bearer ${params.apiKey}` }
     : {};
-  if (isAzureUrl(params.baseUrl, true) || params.responsesApi === true) {
-    const endpoint = new URL(
-      "responses",
-      (isBaseUrlAzureUrl ? transformAzureConfigUrl(params.baseUrl) : params.baseUrl).replace(
-        /\/?$/,
-        "/",
-      ),
-    ).href;
-    return {
-      endpoint,
-      headers,
-      body: {
-        model: params.modelId,
-        input: "Hi",
-        max_output_tokens: 16,
-        stream: false,
-      },
-    };
-  }
-  const endpoint = resolveVerificationEndpoint({
-    baseUrl: params.baseUrl,
-    modelId: params.modelId,
-    endpointPath: "chat/completions",
-  });
+  const responsesApi = isAzureUrl(params.baseUrl, true) || params.responsesApi === true;
+  const endpoint = responsesApi
+    ? new URL(
+        "responses",
+        (isBaseUrlAzureUrl ? transformAzureConfigUrl(params.baseUrl) : params.baseUrl).replace(
+          /\/?$/,
+          "/",
+        ),
+      ).href
+    : resolveVerificationEndpoint({
+        baseUrl: params.baseUrl,
+        modelId: params.modelId,
+        endpointPath: "chat/completions",
+      });
   return {
     endpoint,
     headers,
     body: {
       model: params.modelId,
-      messages: [{ role: "user", content: "Hi" }],
       // Recent OpenAI-family endpoints reject probes below 16 tokens.
-      max_tokens: 16,
+      ...(responsesApi
+        ? { input: "Hi", max_output_tokens: 16 }
+        : { messages: [{ role: "user", content: "Hi" }], max_tokens: 16 }),
       stream: false,
     },
   };
@@ -345,22 +353,31 @@ export function buildAnthropicVerificationProbeRequest(params: {
   };
 }
 
+function isCustomApiCompatibility(value: string): value is CustomApiCompatibility {
+  return value === "openai" || value === "openai-responses" || value === "anthropic";
+}
+
 function parseCustomApiCompatibility(raw?: string): CustomApiCompatibility {
   const compatibilityRaw = normalizeOptionalLowercaseString(raw);
   if (!compatibilityRaw) {
     return "openai";
   }
-  if (
-    compatibilityRaw !== "openai" &&
-    compatibilityRaw !== "openai-responses" &&
-    compatibilityRaw !== "anthropic"
-  ) {
+  if (!isCustomApiCompatibility(compatibilityRaw)) {
     throw new CustomApiError(
       "invalid_compatibility",
       'Invalid --custom-compatibility (use "openai", "openai-responses", or "anthropic").',
     );
   }
   return compatibilityRaw;
+}
+
+function assertValidCustomProviderId(providerId: string | undefined): void {
+  if (providerId && !normalizeEndpointId(providerId)) {
+    throw new CustomApiError(
+      "invalid_provider_id",
+      "Custom provider ID must include letters, numbers, or hyphens.",
+    );
+  }
 }
 
 export function resolveCustomProviderId(params: {
@@ -371,12 +388,7 @@ export function resolveCustomProviderId(params: {
   const providers = params.config.models?.providers ?? {};
   const baseUrl = params.baseUrl.trim();
   const explicitProviderId = params.providerId?.trim();
-  if (explicitProviderId && !normalizeEndpointId(explicitProviderId)) {
-    throw new CustomApiError(
-      "invalid_provider_id",
-      "Custom provider ID must include letters, numbers, or hyphens.",
-    );
-  }
+  assertValidCustomProviderId(explicitProviderId);
   const requestedId =
     normalizeEndpointId(explicitProviderId || buildEndpointIdFromUrl(baseUrl)) || "custom";
   const existing = providers[requestedId];
@@ -411,17 +423,20 @@ export function parseNonInteractiveCustomApiFlags(params: ParseNonInteractiveCus
 
   const apiKey = normalizeOptionalString(params.apiKey);
   const providerId = normalizeOptionalString(params.providerId);
-  if (providerId && !normalizeEndpointId(providerId)) {
+  assertValidCustomProviderId(providerId);
+  const compatibility = parseCustomApiCompatibility(params.compatibility);
+  if (params.noAuth && apiKey) {
     throw new CustomApiError(
-      "invalid_provider_id",
-      "Custom provider ID must include letters, numbers, or hyphens.",
+      "no_auth_conflict",
+      "Custom provider flags conflict: --custom-no-auth cannot be combined with --custom-api-key. Omit one.",
     );
   }
   return {
     baseUrl,
     modelId,
-    compatibility: parseCustomApiCompatibility(params.compatibility),
+    compatibility,
     ...(apiKey ? { apiKey } : {}),
+    ...(params.noAuth ? { noAuth: true } : {}),
     ...(providerId ? { providerId } : {}),
     ...(params.supportsImageInput === undefined
       ? {}
@@ -439,24 +454,13 @@ export function applyCustomApiConfig(params: ApplyCustomApiConfigParams) {
     );
   }
 
-  if (
-    params.compatibility !== "openai" &&
-    params.compatibility !== "openai-responses" &&
-    params.compatibility !== "anthropic"
-  ) {
-    throw new CustomApiError(
-      "invalid_compatibility",
-      'Custom provider compatibility must be "openai", "openai-responses", or "anthropic".',
-    );
-  }
-
   const modelId = normalizeOptionalString(params.modelId) ?? "";
   if (!modelId) {
     throw new CustomApiError("invalid_model_id", "Custom provider model ID is required.");
   }
 
   const isAzure = isAzureUrl(baseUrl);
-  const isAzureOpenAi = isAzureUrl(baseUrl, true);
+  const api = resolveCustomProviderApi(params);
   const resolvedBaseUrl = isAzure ? transformAzureConfigUrl(baseUrl) : baseUrl;
 
   const providerIdResult = resolveCustomProviderId({
@@ -482,7 +486,7 @@ export function applyCustomApiConfig(params: ApplyCustomApiConfigParams) {
 
   const existingProvider = providers[providerId];
   const existingModels = Array.isArray(existingProvider?.models) ? existingProvider.models : [];
-  const hasModel = existingModels.some((model) => model.id === modelId);
+  const existingModel = existingModels.find((model) => model.id === modelId);
   // Azure reasoning deployments usually need explicit reasoning metadata for
   // the provider loop, while non-Azure endpoints rely on model-name inference.
   const isLikelyReasoningModel = isAzure && /\b(o[134]|gpt-([5-9]|\d{2,}))\b/i.test(modelId);
@@ -509,7 +513,7 @@ export function applyCustomApiConfig(params: ApplyCustomApiConfigParams) {
     reasoning: isLikelyReasoningModel,
     ...(isAzure ? { compat: { supportsStore: false } } : {}),
   };
-  const mergedModels = hasModel
+  const mergedModels = existingModel
     ? existingModels.map((model) =>
         model.id === modelId
           ? {
@@ -526,10 +530,25 @@ export function applyCustomApiConfig(params: ApplyCustomApiConfigParams) {
           : model,
       )
     : [...existingModels, nextModel];
-  const { apiKey: existingApiKey, ...existingProviderRest } = existingProvider ?? {};
-  const normalizedApiKey =
-    normalizeOptionalProviderApiKey(params.apiKey) ??
-    normalizeOptionalProviderApiKey(existingApiKey);
+  const {
+    apiKey: existingApiKey,
+    auth: existingAuth,
+    ...existingProviderRest
+  } = existingProvider ?? {};
+  // An explicit key or no-auth choice on this call redeclares the provider's
+  // auth mode; other authored values survive untouched.
+  const redeclaresAuth = params.noAuth === true || params.apiKey !== undefined;
+  const nextAuth = params.noAuth ? ("none" as const) : redeclaresAuth ? undefined : existingAuth;
+  if (nextAuth === "none" && (existingModel?.api ?? api) !== "openai-completions") {
+    throw new CustomApiError(
+      "no_auth_unsupported",
+      'auth: "none" requires the openai-completions adapter. Select that adapter or configure an API key.',
+    );
+  }
+  const normalizedApiKey = params.noAuth
+    ? undefined
+    : (normalizeOptionalProviderApiKey(params.apiKey) ??
+      normalizeOptionalProviderApiKey(existingApiKey));
 
   // Azure clients use api-key headers and no bearer Authorization header.
   const azureHeaders = isAzure && normalizedApiKey ? { "api-key": normalizedApiKey } : undefined;
@@ -544,14 +563,9 @@ export function applyCustomApiConfig(params: ApplyCustomApiConfigParams) {
         [providerId]: {
           ...existingProviderRest,
           baseUrl: resolvedBaseUrl,
-          api: isAzureOpenAi
-            ? "azure-openai-responses"
-            : params.compatibility === "anthropic"
-              ? "anthropic-messages"
-              : params.compatibility === "openai-responses"
-                ? "openai-responses"
-                : "openai-completions",
+          api,
           ...(normalizedApiKey ? { apiKey: normalizedApiKey } : {}),
+          ...(nextAuth ? { auth: nextAuth } : {}),
           ...(isAzure ? { authHeader: false } : {}),
           ...(azureHeaders ? { headers: azureHeaders } : {}),
           models: mergedModels,

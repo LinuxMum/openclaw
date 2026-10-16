@@ -42,8 +42,6 @@ const CODEX_NATIVE_HOOK_RELAY_MIN_TTL_MS = 30 * 60_000;
 export const CODEX_NATIVE_HOOK_RELAY_TTL_GRACE_MS = 5 * 60_000;
 const CODEX_NATIVE_HOOK_RELAY_COMMAND_MIN_PARENT_MARGIN_MS = 250;
 const CODEX_NATIVE_HOOK_RELAY_COMMAND_MAX_PARENT_MARGIN_MS = 1_000;
-// The relay starts a niced Node subprocess, so busy hosts can exceed the former
-// five-second relay timeout before policy and native admission work completes.
 const CODEX_NATIVE_HOOK_RELAY_DEFAULT_TIMEOUT_SEC = 10;
 const CODEX_NATIVE_HOOK_RELAY_UNREGISTER_GRACE_MS = 10_000;
 const CODEX_NATIVE_HOOK_RELAY_UNREGISTER_EXTRA_GRACE_MS = 5_000;
@@ -52,6 +50,14 @@ const CODEX_NATIVE_SPAWN_HOOK_NAMES: readonly string[] = ["spawn_agent", "Agent"
 
 const CODEX_HOOK_MATCHER_NAMES_BY_TOOL_ID: Readonly<Record<string, readonly string[]>> = {
   exec: ["Bash", "exec", "exec_command"],
+  process: ["process", "write_stdin"],
+  read: ["read", "Read", "read_file"],
+  write: ["write", "Write"],
+  edit: ["edit", "Edit"],
+  ls: ["ls", "list_dir"],
+  grep: ["grep", "Grep", "grep_files"],
+  find: ["find", "Glob"],
+  view_image: ["view_image"],
   apply_patch: ["apply_patch", "Write", "Edit"],
   spawn_agent: CODEX_NATIVE_SPAWN_HOOK_NAMES,
 };
@@ -115,18 +121,14 @@ export function scheduleCodexNativeHookRelayUnregister(params: {
   relay: ReturnType<typeof registerNativeHookRelayForBundledRuntime>;
   hookTimeoutSec?: number;
 }): void {
+  const hookTimeoutMs =
+    finiteSecondsToTimerSafeMilliseconds(normalizeHookTimeoutSec(params.hookTimeoutSec)) ?? 0;
   nativeHookRelayUnregisterQueue.schedule(
     params.relay,
-    resolveCodexNativeHookRelayUnregisterGraceMs(params.hookTimeoutSec),
-  );
-}
-
-function resolveCodexNativeHookRelayUnregisterGraceMs(hookTimeoutSec: number | undefined): number {
-  const hookTimeoutMs =
-    finiteSecondsToTimerSafeMilliseconds(normalizeHookTimeoutSec(hookTimeoutSec)) ?? 0;
-  return Math.max(
-    CODEX_NATIVE_HOOK_RELAY_UNREGISTER_GRACE_MS,
-    addTimerTimeoutGraceMs(hookTimeoutMs, CODEX_NATIVE_HOOK_RELAY_UNREGISTER_EXTRA_GRACE_MS) ?? 0,
+    Math.max(
+      CODEX_NATIVE_HOOK_RELAY_UNREGISTER_GRACE_MS,
+      addTimerTimeoutGraceMs(hookTimeoutMs, CODEX_NATIVE_HOOK_RELAY_UNREGISTER_EXTRA_GRACE_MS) ?? 0,
+    ),
   );
 }
 
@@ -206,6 +208,8 @@ export function createCodexNativeHookRelay(params: {
     onCleanupFailure(error: Error): void;
   };
   assertCurrent?: () => void;
+  assertCurrentAsync?: () => Promise<void>;
+  retainExecutionPolicy?: () => () => void;
   onPreToolUseFailure: (failure: CodexNativePreToolUseFailure) => void | Promise<void>;
 }): CodexNativeHookRelay | undefined {
   if (params.options?.enabled === false) {
@@ -217,12 +221,7 @@ export function createCodexNativeHookRelay(params: {
   const directChildClaims = new Map<string, symbol>();
   const pendingDirectChildAdmissions = new Map<
     string,
-    {
-      promise: Promise<symbol>;
-      resolve: (claim: symbol) => void;
-      reject: (reason: Error) => void;
-      waiters: number;
-    }
+    ReturnType<typeof createDeferred<symbol>> & { waiters: number }
   >();
   let foregroundClosed = false;
   let successfulYieldRetentionAuthorized = false;
@@ -235,6 +234,7 @@ export function createCodexNativeHookRelay(params: {
     pendingDirectChildAdmissions.clear();
   };
   let releaseProcessAdmission: (() => void) | undefined;
+  let releaseExecutionPolicy: (() => void) | undefined;
   let processAdmissionDisposed = false;
   let remoteCredential: ReturnType<typeof createCodexNativeHookRemoteCredential> | undefined;
   let remoteCleanup: Promise<void> | undefined;
@@ -270,11 +270,14 @@ export function createCodexNativeHookRelay(params: {
     signal: params.signal,
     runBeforeToolCall: params.hostCapabilities.runBeforeToolCall,
     executionAdmission:
-      params.nativeProcessAuthority || params.nativeModelAdmission
+      params.nativeProcessAuthority ||
+      params.nativeModelAdmission ||
+      params.hostCapabilities.workspaceReadiness
         ? {
             toolNames: [
               ...(params.nativeProcessAuthority ? ["exec"] : []),
               ...(params.nativeModelAdmission ? modelInputTools : []),
+              ...(params.hostCapabilities.workspaceReadiness?.toolNames ?? []),
             ],
             admit: async (invocation, assertAdmissionCurrent, preparation) => {
               const payload = invocation.rawPayload;
@@ -325,6 +328,12 @@ export function createCodexNativeHookRelay(params: {
                 assertAdmissionCurrent();
                 return undefined;
               }
+              if (
+                !params.nativeProcessAuthority ||
+                !["Bash", "exec", "exec_command"].includes(invocation.toolName ?? "")
+              ) {
+                return undefined;
+              }
               const rootThreadId =
                 isJsonObject(payload) && typeof payload.session_id === "string"
                   ? payload.session_id.trim()
@@ -336,8 +345,8 @@ export function createCodexNativeHookRelay(params: {
                   "Codex native process admission requires exact thread, turn, and tool identities",
                 );
               }
-              params.nativeProcessAuthority!.owner.admit(
-                params.nativeProcessAuthority!.client(),
+              params.nativeProcessAuthority.owner.admit(
+                params.nativeProcessAuthority.client(),
                 { threadId, turnId: invocation.turnId, itemId: invocation.toolUseId },
                 assertAdmissionCurrent,
                 childThreadId ? rootThreadId : undefined,
@@ -351,6 +360,7 @@ export function createCodexNativeHookRelay(params: {
       params.hostCapabilities.assertActive();
       params.assertCurrent?.();
     },
+    assertActiveAsync: params.assertCurrentAsync,
     retention: {
       readClaim: readCodexNativeChildThreadId,
       // A child claim identifies the subject; successful parent finalization
@@ -410,6 +420,7 @@ export function createCodexNativeHookRelay(params: {
         rejectPendingAdmissions("native hook relay registration closed");
         processAdmissionDisposed = true;
         releaseProcessAdmission?.();
+        releaseExecutionPolicy?.();
         if (remoteCredential) {
           remoteCleanup = remoteCredential
             .dispose()
@@ -424,14 +435,14 @@ export function createCodexNativeHookRelay(params: {
     },
     onPreToolUseFailure: params.onPreToolUseFailure,
     command: {
-      // Hook relay subprocesses are observational for most tool events; keep
-      // them lower priority so they do not compete with the active reply turn.
-      nice: 10,
-      timeoutMs: params.options?.gatewayTimeoutMs,
+      timeoutMs: params.hostCapabilities.workspaceReadiness
+        ? Math.max(params.options?.gatewayTimeoutMs ?? 0, params.attemptTimeoutMs)
+        : params.options?.gatewayTimeoutMs,
     },
   });
   if (!processAdmissionDisposed) {
     try {
+      releaseExecutionPolicy = params.retainExecutionPolicy?.();
       releaseProcessAdmission = params.nativeProcessAuthority?.owner.retainAdmission();
     } catch (error) {
       relay.unregister();
@@ -447,6 +458,7 @@ export function createCodexNativeHookRelay(params: {
         params.hostCapabilities.assertActive();
         params.assertCurrent?.();
       },
+      assertCurrentAsync: params.assertCurrentAsync,
     });
     if (processAdmissionDisposed) {
       void remoteCredential.dispose();

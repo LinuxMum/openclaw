@@ -120,6 +120,10 @@ export function registerOnboardAuthOptions(command: Command): Command {
   return command
     .option("--custom-base-url <url>", "Custom provider base URL")
     .option("--custom-api-key <key>", "Custom provider API key (optional)")
+    .option(
+      "--custom-no-auth",
+      "Use no auth for a custom OpenAI Chat Completions endpoint (sends no Authorization header)",
+    )
     .option("--custom-model-id <id>", "Custom provider model ID")
     .option("--custom-provider-id <id>", "Custom provider ID (optional; auto-derived by default)")
     .option(
@@ -210,16 +214,12 @@ export async function resolveOnboardCommandOptions(
     tokenProfileId: opts.tokenProfileId as string | undefined,
     tokenExpiresIn: opts.tokenExpiresIn as string | undefined,
     secretInputMode: opts.secretInputMode as OnboardOptions["secretInputMode"],
-    ...Object.fromEntries(
-      ONBOARD_AUTH_FLAGS.map((flag) => [
-        flag.optionKey,
-        opts[flag.optionKey] as string | undefined,
-      ]),
-    ),
+    ...Object.fromEntries(ONBOARD_AUTH_FLAGS.map((flag) => [flag.optionKey, opts[flag.optionKey]])),
     cloudflareAiGatewayAccountId: opts.cloudflareAiGatewayAccountId as string | undefined,
     cloudflareAiGatewayGatewayId: opts.cloudflareAiGatewayGatewayId as string | undefined,
     customBaseUrl: opts.customBaseUrl as string | undefined,
     customApiKey: opts.customApiKey as string | undefined,
+    customNoAuth: opts.customNoAuth as boolean | undefined, // SAFETY: Commander parses valueless flags as boolean | undefined.
     customModelId: opts.customModelId as string | undefined,
     customProviderId: opts.customProviderId as string | undefined,
     customCompatibility: opts.customCompatibility as OnboardOptions["customCompatibility"],
@@ -255,6 +255,19 @@ export async function resolveOnboardCommandOptions(
   };
 }
 
+export function registerOnboardFlowOptions(command: Command): Command {
+  return command
+    .option("--classic", "Use the classic multi-step setup wizard", false)
+    .option("--tui", "Use the terminal hatch instead of the browser handoff", false)
+    .option(
+      "--accept-risk",
+      "Acknowledge that agents are powerful and full system access is risky (required for --non-interactive)",
+      false,
+    )
+    .option("--flow <flow>", "Onboard flow: quickstart|advanced|manual|import")
+    .option("--mode <mode>", "Onboard mode: local|remote");
+}
+
 export function registerOnboardCommand(program: Command): void {
   const command = program
     .command("onboard")
@@ -272,16 +285,8 @@ export function registerOnboardCommand(program: Command): void {
     )
     .option("--reset-scope <scope>", "Reset scope: config|config+creds+sessions|full")
     .option("--non-interactive", "Run without prompts", false)
-    .option("--modern", "Open inference-gated OpenClaw (kept for compatibility)", false)
-    .option("--classic", "Use the classic multi-step setup wizard", false)
-    .option("--tui", "Use the terminal hatch instead of the browser handoff", false)
-    .option(
-      "--accept-risk",
-      "Acknowledge that agents are powerful and full system access is risky (required for --non-interactive)",
-      false,
-    )
-    .option("--flow <flow>", "Onboard flow: quickstart|advanced|manual|import")
-    .option("--mode <mode>", "Onboard mode: local|remote");
+    .option("--modern", "Open inference-gated OpenClaw (kept for compatibility)", false);
+  registerOnboardFlowOptions(command);
 
   registerOnboardAuthOptions(command);
   registerOnboardGatewayOptions(command);

@@ -1,5 +1,3 @@
-// Applies media-understanding outputs to inbound message context, including
-// attachment normalization, provider execution, file text extraction, and echoing.
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import pMap from "p-map";
 import type { ActiveMediaModel } from "../../packages/media-understanding-common/src/active-model.js";
@@ -50,9 +48,9 @@ const AUDIO_ONLY_CAPABILITY_ORDER: MediaUnderstandingCapability[] = ["audio"];
 const EMPTY_VOICE_NOTE_PLACEHOLDER =
   "[Voice note could not be transcribed because the audio attachment was too small]";
 
-function appendFileBlocks(body: string | undefined, suffix: string | undefined): string {
+function appendFileBlocks(body: string, suffix: string | undefined): string {
   if (suffix === undefined) {
-    return body ?? "";
+    return body;
   }
   const base = typeof body === "string" ? body.trim() : "";
   if (!base) {
