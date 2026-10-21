@@ -100,7 +100,15 @@ it.each(["legacy", "malformed", "unknown-policy"])(
               .update(OPENCLAW_AGENT_SCHEMA_SQL)
               .digest("hex")
           : "unknown-policy";
-      expect(writeSqliteCleanCloseSeal(agentPath, identity, file, seal)).toBe(true);
+      expect(
+        writeSqliteCleanCloseSeal(agentPath, identity, file, {
+          ...seal,
+          identity:
+            kind === "legacy"
+              ? undefined
+              : { ...sqliteDatabaseSealSchemaFor("agent")!.identity, policy: -1 },
+        }),
+      ).toBe(true);
     }
     retireSqliteDatabaseAdmissionForPath(agentPath);
     expect(readSqliteDatabaseCleanClose(agentPath)).toBe(false);
@@ -122,7 +130,7 @@ it("admits every previously sealed same-version agent before transcript readers 
   const agents = ids.map((agentId) => ({ agentId, path: fixture.agent(agentId).path }));
   closeDatabases();
   for (const agent of agents) {
-    const identity = sqliteDatabaseSealSchemaFor("agent")!;
+    const identity = sqliteDatabaseSealSchemaFor("agent")!.schemaIdentity;
     const seal = readSqliteCleanCloseSeal(agent.path, fs.statSync(agent.path, { bigint: true }))!;
     expect(seal).toBeDefined();
     revokeSqliteDatabaseAdmissionsForPath(agent.path);

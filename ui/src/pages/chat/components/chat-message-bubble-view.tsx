@@ -17,20 +17,21 @@ import {
 import { readNodePermissionRequest } from "../../../../../packages/gateway-protocol/src/node-permissions.js";
 import { toSanitizedMarkdownHtml } from "../../../components/markdown.ts";
 import { Icon } from "../../../components/solid/icon.tsx";
+import { registerChatComposerEnglish } from "../../../i18n/locales/en-chat-composer.ts";
 import { registerChatMessageMetadataEnglish } from "../../../i18n/locales/en-chat-message-metadata.ts";
+import { registerChatSessionEnglish } from "../../../i18n/locales/en-chat-session.ts";
 import type { ToolCard } from "../../../lib/chat/chat-types.ts";
 import { resolveMessageDisplayMarkdown } from "../../../lib/chat/message-display.ts";
+import { elementRef } from "../../../lib/reactive/element-ref.ts";
 import { registerEnglishCatalog, t } from "../../../lib/reactive/i18n.ts";
 import { PluginSurface } from "../../../plugins/control-ui-view.solid.tsx";
 import { assistantMessageIsInterrupted } from "../chat-assistant-reply.ts";
+import "../../../components/solid/person-reference.tsx";
 import { usePanePresentation } from "../chat-pane-presentation.ts";
 import { AsyncQuestionSummary } from "./chat-async-question-summary.tsx";
-import "../../../components/solid/person-reference.tsx";
 import { ChatBubbleActivity } from "./chat-bubble-activity-view.tsx";
-import { ChatPermissionCard } from "./chat-divider.tsx";
 import { ActivityOperation } from "./chat-message-activity-operation.tsx";
 import { OmittedMedia } from "./chat-message-attachment-status-solid.tsx";
-import { AssistantAttachments, MessageAttachment } from "./chat-message-attachments-solid.tsx";
 import type {
   ActivityOperationProps,
   GroupedMessageOptions,
@@ -40,8 +41,12 @@ import {
   type GroupedMessagePresentation,
 } from "./chat-message-bubble-presentation.ts";
 import { MessageWorkContext } from "./chat-message-context-view.tsx";
-import { MessageImages } from "./chat-message-images-solid.tsx";
-import "./chat-clawhub-card.ts";
+import {
+  AssistantAttachments,
+  ChatClawHubCard,
+  MessageAttachment,
+  MessageImages,
+} from "./chat-message-deferred.tsx";
 import type { ChatMessageRenderPreparation } from "./chat-message-markdown-view.tsx";
 import type { MarkdownMedia, PositionedMedia } from "./chat-message-media-markdown.ts";
 import { prepareMarkdownMedia } from "./chat-message-media-markdown.ts";
@@ -52,20 +57,28 @@ import {
   releaseChatMediaResourceOwner,
 } from "./chat-message-media.ts";
 import { MarkdownText, MessageJson, MessageMarkdown } from "./chat-message-text-view.tsx";
+import { ChatPermissionCard } from "./chat-permission-card.tsx";
 import { ReplyLineView } from "./chat-reply-attribution.tsx";
 import type { SidebarContent } from "./chat-sidebar-content-types.ts";
 import {
-  ChatToolApprovalReviews,
+  ToolApprovalReviews,
   ChatToolCard,
   ChatToolIcon,
   syncToolDisclosureOverflow,
   type ToolCardOptions,
 } from "./chat-tool-cards.solid.tsx";
-import { ChatToolContent, ChatToolRawOutput, ChatToolOutcome } from "./chat-tool-content.solid.tsx";
+import {
+  ExpandedToolCardContent,
+  RawOutputToggle,
+  ToolOutcome,
+} from "./chat-tool-content.solid.tsx";
 import { toolResultSurfaceProps } from "./chat-tool-render-model.ts";
 import { TranscriptMessageElementsContext } from "./chat-transcript-message-elements.ts";
 import { WorkspaceConflictTranscriptMessage } from "./chat-workspace-conflict.ts";
 import { ToolPreview } from "./widget-card.ts";
+
+registerEnglishCatalog(registerChatComposerEnglish);
+registerEnglishCatalog(registerChatSessionEnglish);
 
 registerEnglishCatalog(registerChatMessageMetadataEnglish);
 
@@ -98,7 +111,6 @@ export function GroupedMessage(props: GroupedMessageProps) {
   const messageElements = useContext(TranscriptMessageElementsContext);
   // The keyed message owns this DOM registration through acknowledgement and option refreshes.
   const initialMessageKey = untrack(() => props.messageKey);
-  const entryRef = messageElements?.forKey(initialMessageKey);
   // Expiring pairing QR attachments schedule a timer at their resource owner.
   createEffect(
     () => [props.messageKey, state().nextPairingQrExpiresAt] as const,
@@ -111,12 +123,16 @@ export function GroupedMessage(props: GroupedMessageProps) {
       fallback={
         <Show when={!state().empty}>
           {(_visible) => {
-            onCleanup(() => entryRef?.(undefined));
+            const entryRef = messageElements?.forKey(initialMessageKey);
+            const bindEntry = elementRef((element) => {
+              entryRef?.(element);
+              return () => entryRef?.(undefined);
+            });
             return (
               <>
                 <div
                   class={state().bubbleClasses}
-                  ref={(element) => entryRef?.(element)}
+                  ref={[bindEntry]}
                   data-message-id={props.messageKey}
                   data-file-session-key={props.options.fileLinkSessionKey}
                   data-entry-id={props.options.entryId || undefined}
@@ -192,11 +208,21 @@ export function GroupedMessage(props: GroupedMessageProps) {
         </Show>
       }
     >
-      <WorkspaceConflictTranscriptMessage
-        conflict={state().workspaceConflict!}
-        messageKey={props.messageKey}
-        entryId={props.options.entryId}
-      />
+      {(conflict) => {
+        const entryRef = messageElements?.forKey(initialMessageKey);
+        const bindEntry = elementRef((element) => {
+          entryRef?.(element);
+          return () => entryRef?.(undefined);
+        });
+        return (
+          <WorkspaceConflictTranscriptMessage
+            conflict={conflict()}
+            messageKey={props.messageKey}
+            entryId={props.options.entryId}
+            ref={bindEntry}
+          />
+        );
+      }}
     </Show>
   );
 }
@@ -305,11 +331,12 @@ function AssistantViews(props: ContentProps) {
               />
               <Show when={block().rawText}>
                 <div class="chat-tool-card__widget-raw">
-                  <ChatToolRawOutput
-                    text={block().rawText!}
-                    toggleRef={(element) => (rawToggle = element)}
-                    style={{ display: "contents" }}
-                  />
+                  <openclaw-chat-tool-raw style={{ display: "contents" }}>
+                    <RawOutputToggle
+                      text={block().rawText!}
+                      toggleRef={(element) => (rawToggle = element)}
+                    />
+                  </openclaw-chat-tool-raw>
                 </div>
               </Show>
             </div>
@@ -446,12 +473,7 @@ function BubbleContents(props: ContentProps) {
     <>
       <Show when={props.state().sourceRole === "assistant"}>
         <For each={props.state().clawHubCards} keyed={(card) => card.id}>
-          {(card) => (
-            <openclaw-chat-clawhub-card
-              prop:recommendation={card()}
-              prop:agentId={props.options.agentId}
-            />
-          )}
+          {(card) => <ChatClawHubCard recommendation={card()} agentId={props.options.agentId} />}
         </For>
       </Show>
       <PairingQrNotices count={props.state().expiredPairingQrCount} />
@@ -473,6 +495,7 @@ function BubbleContents(props: ContentProps) {
         onOpenSidebar={props.onOpenSidebar}
         onAssistantAttachmentLoaded={props.options.onAssistantAttachmentLoaded}
         inlinePlayback={props.state().normalizedRole === "assistant"}
+        inlineComments={props.state().inlineComments}
       />
       <Show when={props.state().isStandaloneToolMessage}>
         <AssistantViews {...props} />
@@ -508,25 +531,26 @@ function BubbleContents(props: ContentProps) {
             />
           }
         >
-          <ChatToolContent
-            card={props.state().singleToolCard!}
-            options={props.state().toolRenderOptions}
-            style={{ display: "contents" }}
-          />
+          <openclaw-chat-tool-content style={{ display: "contents" }}>
+            <ExpandedToolCardContent
+              card={props.state().singleToolCard!}
+              options={props.state().toolRenderOptions}
+            />
+          </openclaw-chat-tool-content>
         </Show>
       </Show>
       <Show when={props.state().isStandaloneToolMessage && props.state().failedToolCard}>
-        <ChatToolOutcome
-          outcome="failed"
-          exitCode={props.state().failedToolCard!.exitCode}
-          style={{ display: "contents" }}
-        />
+        <openclaw-chat-tool-outcome style={{ display: "contents" }}>
+          <ToolOutcome outcome="failed" exitCode={props.state().failedToolCard!.exitCode} />
+        </openclaw-chat-tool-outcome>
       </Show>
     </>
   );
 }
 
 function ToolMessageFallback(props: ContentProps) {
+  let disclosureContent: HTMLSpanElement | undefined;
+  const syncOverflow = (event: Event) => syncToolDisclosureOverflow(event, disclosureContent);
   return (
     <div
       class={[
@@ -538,8 +562,8 @@ function ToolMessageFallback(props: ContentProps) {
         class="chat-inline-disclosure chat-tool-msg-summary"
         type="button"
         aria-expanded={props.state().toolMessageExpanded ? "true" : "false"}
-        onPointerEnter={syncToolDisclosureOverflow}
-        onFocus={syncToolDisclosureOverflow}
+        onPointerEnter={syncOverflow}
+        onFocus={syncOverflow}
         onClick={() =>
           props.options.onToggleToolMessageExpanded?.(
             props.state().toolMessageDisclosureId,
@@ -559,7 +583,10 @@ function ToolMessageFallback(props: ContentProps) {
             />
           </Show>
         </span>
-        <span class="chat-tool-disclosure__content">
+        <span
+          ref={(element) => (disclosureContent = element)}
+          class="chat-tool-disclosure__content"
+        >
           <span class="chat-tool-msg-summary__label">{props.state().toolMessageLabel}</span>
           <Show
             when={props.state().toolSummaryLabel}
@@ -585,7 +612,11 @@ function ToolMessageFallback(props: ContentProps) {
         </div>
       </Show>
       <For each={props.state().toolCards} keyed={(card) => card.callId ?? card}>
-        {(card) => <ChatToolApprovalReviews card={card()} style={{ display: "contents" }} />}
+        {(card) => (
+          <openclaw-chat-tool-reviews style={{ display: "contents" }}>
+            <ToolApprovalReviews card={card()} />
+          </openclaw-chat-tool-reviews>
+        )}
       </For>
     </div>
   );

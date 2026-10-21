@@ -74,6 +74,7 @@ import {
   navDrawerFocusableElements,
   visibleNavDrawerToggle,
   type ShellNavigationElements,
+  type ShellNavigationSurfaces,
 } from "./navigation-surface.ts";
 import { isCustodianPanelAvailable, isHomePanelAvailable } from "./panel-availability.ts";
 import { NAV_WIDTH_MAX, NAV_WIDTH_MIN } from "./settings.ts";
@@ -82,7 +83,7 @@ import { retryStaleChunkReloadWhenReachable } from "./stale-chunk-reload.ts";
 let nativeCommandsOwner: (() => void)[] | undefined;
 
 export interface ShellChromeHost
-  extends ShellNewSessionHost, ShellPanelHost, ShellNavigationElements {
+  extends ShellNewSessionHost, ShellPanelHost, ShellNavigationElements, ShellNavigationSurfaces {
   readonly elements: ShellOwnedElements;
   readonly element: HTMLElement;
   readonly isConnected: boolean;
@@ -91,7 +92,6 @@ export interface ShellChromeHost
   readonly commandPaletteElement: OptionalCustomElement;
   readonly execApprovalElement: OptionalCustomElement;
   readonly queryRenderedElement: (tagName: string) => Element | null;
-  readonly navigationSidebar: HTMLElement;
   navDrawerOpen: boolean;
   desktopNavigationExpanded: boolean;
   navDrawerTrigger: HTMLElement | null;
@@ -205,7 +205,7 @@ export class ShellChromeOwner {
         host.closeNavDrawer({ restoreFocus: true });
         return;
       }
-      host.navDrawerTrigger = trigger ?? visibleNavDrawerToggle(host.element) ?? null;
+      host.navDrawerTrigger = trigger ?? visibleNavDrawerToggle(host) ?? null;
       host.navDrawerOpen = true;
       setToastInNavDrawer(host, true);
       void host.updateComplete.then(() => {
@@ -229,16 +229,31 @@ export class ShellChromeOwner {
     if (nextNavCollapsed) {
       this.dismissSidebarTransientMenus();
     }
-    // The sidebar owns its rail button markup and exposes no focused-button handle.
-    const activeRailView = host.navigationSidebar.querySelector<HTMLElement>(
-      '[data-navigation-view][aria-pressed="true"]',
-    );
+    const activeRailView = host.navigationSidebar.activeNavigationViewElement?.();
     host.closeNavDrawer();
     context.navigation.update({ navCollapsed: nextNavCollapsed });
     if (nextNavCollapsed) {
       void host.updateComplete.then(() => this.restoreFocusTo(activeRailView));
     }
   };
+
+  private finishNavigationMotion(): void {
+    // Finish only this invocation's navigation transitions after the DOM commit,
+    // before paint. CSS remains unchanged for the next click or reduced motion.
+    void this.host.updateComplete.then(() => {
+      const { shellElement, navDrawerElement, navBackdropElement } = this.host;
+      for (const element of [shellElement, navDrawerElement, navBackdropElement]) {
+        for (const animation of element?.getAnimations() ?? []) {
+          if (
+            animation instanceof CSSTransition &&
+            (element !== shellElement || animation.transitionProperty === "grid-template-columns")
+          ) {
+            animation.finish();
+          }
+        }
+      }
+    });
+  }
 
   /** Restore to the persistent rail view, or content when navigation is unavailable. */
   restoreFocusTo = (target: HTMLElement | null | undefined): void =>
@@ -342,7 +357,7 @@ export class ShellChromeOwner {
     host.invalidate();
     void host.updateComplete.then(() => {
       if (isMobileNavLayout() && !host.navDrawerOpen && dismissedSidebarMenus) {
-        requestAnimationFrame(() => this.restoreFocusTo(visibleNavDrawerToggle(host.element)));
+        requestAnimationFrame(() => this.restoreFocusTo(visibleNavDrawerToggle(host)));
       }
     });
   };
@@ -368,8 +383,7 @@ export class ShellChromeOwner {
     }
   };
 
-  dismissSidebarTransientMenus = (): boolean =>
-    dismissNavigationTransientSurfaces(this.host.element);
+  dismissSidebarTransientMenus = (): boolean => dismissNavigationTransientSurfaces(this.host);
 
   private readonly handleDocumentKeydownBubble = (event: KeyboardEvent): void => {
     const host = this.host;
@@ -406,7 +420,13 @@ export class ShellChromeOwner {
       return;
     }
     if (host.navDrawerOpen && isMobileNavLayout()) {
+      const togglesSidebar =
+        !event.defaultPrevented &&
+        matchesShortcutCombo(KEYBOARD_SHORTCUT_COMBOS.toggleSidebar, event);
       handleNavDrawerKeydown(host, event);
+      if (togglesSidebar) {
+        this.finishNavigationMotion();
+      }
       return;
     }
     // A replaced workspace can retain its palette ref after the DOM is detached.
@@ -470,6 +490,7 @@ export class ShellChromeOwner {
     if (matchesShortcutCombo(KEYBOARD_SHORTCUT_COMBOS.toggleSidebar, event)) {
       event.preventDefault();
       this.toggleNavigationSurface();
+      this.finishNavigationMotion();
     }
   };
 

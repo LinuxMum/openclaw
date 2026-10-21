@@ -1,8 +1,9 @@
 import { validateToolArguments } from "@openclaw/llm-core/validation";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../../config/config.js";
 import { isRecord } from "../../utils.js";
 import { createCronTool } from "./cron-tool.js";
+import * as gatewayModule from "./gateway.js";
 
 const gateway = vi.fn();
 const job = {
@@ -11,7 +12,7 @@ const job = {
   payload: { kind: "agentTurn", message: "work" },
 };
 function execute(args: Record<string, unknown>) {
-  return createCronTool(undefined, { callGatewayTool: gateway }).execute("cron", args);
+  return createCronTool().execute("cron", args);
 }
 function validatePrepared(tool: ReturnType<typeof createCronTool>, prepared: unknown) {
   if (!isRecord(prepared)) {
@@ -33,6 +34,8 @@ function expectAdd(params: Record<string, unknown>) {
 }
 
 beforeEach(() => {
+  const gatewaySpy = vi.spyOn(gatewayModule, "callGatewayTool").mockImplementation(gateway);
+  onTestFinished(() => gatewaySpy.mockRestore());
   setRuntimeConfigSnapshot({});
   gateway.mockReset().mockResolvedValue({ ok: true });
 });
@@ -66,7 +69,7 @@ describe("cron review regression boundaries", () => {
       expected: { id: "existing-job-id", patch: { enabled: false } },
     },
   ])("executes the verbatim prompt example: $example", async ({ example, method, expected }) => {
-    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const tool = createCronTool();
     expect(tool.description).toContain(example);
     const prepared = tool.prepareArguments?.(JSON.parse(example));
     const validated = validatePrepared(tool, prepared);
@@ -79,7 +82,7 @@ describe("cron review regression boundaries", () => {
   });
 
   it.each(["", "   "])("ignores blank flat fillers %j beside a nested job", async (blank) => {
-    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const tool = createCronTool();
     const args = {
       action: "add",
       job,
@@ -103,7 +106,7 @@ describe("cron review regression boundaries", () => {
   });
 
   it("accepts a nested at reminder with a blank schedule timezone", async () => {
-    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const tool = createCronTool();
     const nested = {
       name: "stretch",
       sessionTarget: "main",
@@ -123,7 +126,7 @@ describe("cron review regression boundaries", () => {
   });
 
   it("continues ignoring cosmetic flat name beside a nested job", async () => {
-    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const tool = createCronTool();
     const args = { action: "add", name: "ignored flat name", job };
     expect(tool.prepareArguments?.(args)).toEqual(args);
     await tool.execute("nested-flat-name", validatePrepared(tool, args));
@@ -133,7 +136,7 @@ describe("cron review regression boundaries", () => {
   it.each(["add", "update"])(
     "rejects an empty %s wrapper with no flat content before Gateway dispatch",
     async (action) => {
-      const tool = createCronTool(undefined, { callGatewayTool: gateway });
+      const tool = createCronTool();
       const prepared = tool.prepareArguments?.({ action, id: "job", job: {} });
       await expect(tool.execute("empty-wrapper", validatePrepared(tool, prepared))).rejects.toThrow(
         "job required",
@@ -143,7 +146,7 @@ describe("cron review regression boundaries", () => {
   );
 
   it.each(["add", "update"])("recovers flat content from an empty %s wrapper", async (action) => {
-    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const tool = createCronTool();
     const prepared = tool.prepareArguments?.({
       action,
       id: "job",
@@ -171,7 +174,7 @@ describe("cron review regression boundaries", () => {
   });
 
   it("ignores top-level wake mode beside a nested update", async () => {
-    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const tool = createCronTool();
     const args = { action: "update", id: "job", mode: "now", job: { enabled: false } };
     const prepared = tool.prepareArguments?.(args);
     expect(prepared).toEqual(args);
@@ -191,14 +194,14 @@ describe("cron review regression boundaries", () => {
       atMs: 123,
       "payload.toolsAllow": ["write"],
     };
-    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const tool = createCronTool();
     expect(tool.prepareArguments?.(args)).toEqual(args);
     await tool.execute("nested-aliases", args);
     expectAdd({ schedule: job.schedule, payload: job.payload });
   });
 
   it.each(["", "   "])("treats blank flat tz %j as absent through execute", async (tz) => {
-    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const tool = createCronTool();
     const prepared = tool.prepareArguments?.({
       action: "add",
       at: "2026-11-01T09:00:00Z",
@@ -220,7 +223,7 @@ describe("cron review regression boundaries", () => {
       tz: "UTC",
       staggerMs: 30_000,
     };
-    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const tool = createCronTool();
     const args = { action: "add", job: { ...job, schedule } };
     expect(tool.prepareArguments?.(args)).toEqual(args);
     await tool.execute("nested-stale-at", validatePrepared(tool, tool.prepareArguments?.(args)));
@@ -228,7 +231,7 @@ describe("cron review regression boundaries", () => {
   });
 
   it("leaves nested agentTurn leftover text to normal normalization", async () => {
-    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const tool = createCronTool();
     const args = {
       action: "add",
       job: { ...job, payload: { kind: "agentTurn", message: "work", text: "leftover" } },
@@ -242,7 +245,7 @@ describe("cron review regression boundaries", () => {
   });
 
   it("leaves nested reminder leftover message to normal normalization", async () => {
-    const tool = createCronTool(undefined, { callGatewayTool: gateway });
+    const tool = createCronTool();
     const args = {
       action: "add",
       job: { ...job, payload: { kind: "systemEvent", text: "stretch", message: "leftover" } },
@@ -268,7 +271,7 @@ describe("cron review regression boundaries", () => {
         toolsAllow: '["read"]',
         job: json ? JSON.stringify(nested) : nested,
       };
-      const tool = createCronTool(undefined, { callGatewayTool: gateway });
+      const tool = createCronTool();
       const error =
         "Do not mix job with flat fields: tz, toolsAllow. Retry with job only, or remove job and send all intended settings as flat fields.";
       expect(() => tool.prepareArguments?.(args)).toThrow(error);
@@ -292,7 +295,7 @@ describe("cron review regression boundaries", () => {
   ] as const)(
     "rejects advertised flat %s beside a nonempty job on add and update",
     async (field, value) => {
-      const tool = createCronTool(undefined, { callGatewayTool: gateway });
+      const tool = createCronTool();
       for (const action of ["add", "update"]) {
         const args = { action, id: "job", job, [field]: value };
         const error = `Do not mix job with flat fields: ${field}. Retry with job only, or remove job and send all intended settings as flat fields.`;
@@ -344,7 +347,7 @@ describe("cron review regression boundaries", () => {
         configRevision: "rev",
         payload: { kind, ...(kind === "agentTurn" ? { message: "old" } : { text: "old" }) },
       });
-      const tool = createCronTool(undefined, { callGatewayTool: gateway });
+      const tool = createCronTool();
       const prepared = tool.prepareArguments?.({
         action: "update",
         id: "job",

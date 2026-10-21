@@ -1,5 +1,5 @@
 import type { JSX } from "@solidjs/web";
-import { createComponent, createMemo, lazy, Loading, Show, type Accessor } from "solid-js";
+import { createMemo, lazy, Loading, Show, type Accessor } from "solid-js";
 import {
   isThemeAvatarHatId,
   type ThemeBranding,
@@ -27,6 +27,7 @@ const AgentAvatarFace = lazy(() => import("../agent-avatar-face.tsx"), {
 });
 
 export function AgentIdentityAvatar(props: {
+  elementRef?: (element: HTMLElement) => void;
   agent: AgentIdentity;
   class?: string;
   onImageError?: () => void;
@@ -46,10 +47,16 @@ export function AgentIdentityAvatar(props: {
     <Show
       when={!isReservedSystemAgentId(props.agent.id)}
       fallback={
-        <SystemAgentAvatar name={props.agent.name} class={props.class} branding={branding.read()} />
+        <SystemAgentAvatar
+          name={props.agent.name}
+          class={props.class}
+          branding={branding.read()}
+          elementRef={props.elementRef}
+        />
       }
     >
       <span
+        ref={(element) => props.elementRef?.(element)}
         data-avatar-state={presentation.state()}
         class={["identity-avatar--agent", props.class, presentation.classes()]}
         role={props.agent.name ? "img" : undefined}
@@ -108,7 +115,10 @@ export function AgentAvatarHat(props: { agentId: string; branding: ThemeBranding
               </Show>
             }
           >
-            {(id) => createComponent(AVATAR_HAT_ARTWORK[id], {})}
+            {(id) => {
+              const Artwork = AVATAR_HAT_ARTWORK[id];
+              return <Artwork />;
+            }}
           </Show>
         </span>
       )}
@@ -116,12 +126,18 @@ export function AgentAvatarHat(props: { agentId: string; branding: ThemeBranding
   );
 }
 
-function SystemAgentAvatar(props: { name?: string; class?: string; branding: ThemeBranding }) {
+function SystemAgentAvatar(props: {
+  name?: string;
+  class?: string;
+  branding: ThemeBranding;
+  elementRef?: (element: HTMLElement) => void;
+}) {
   return (
     <Show
       when={props.branding.brandIcon !== "claw"}
       fallback={
         <img
+          ref={(element) => props.elementRef?.(element)}
           class={["identity-avatar--agent", props.class]}
           src={inferControlUiPublicAssetPath("favicon.svg")}
           alt={props.name ?? ""}
@@ -130,6 +146,7 @@ function SystemAgentAvatar(props: { name?: string; class?: string; branding: The
       }
     >
       <span
+        ref={(element) => props.elementRef?.(element)}
         class={["identity-avatar--agent", "identity-avatar--neutral", props.class]}
         role={props.name ? "img" : undefined}
         aria-label={props.name}

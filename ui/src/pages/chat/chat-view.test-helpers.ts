@@ -12,10 +12,11 @@ import {
 import { normalizeApplicationContext } from "../../test-helpers/application-context-fixtures.ts";
 import { mountSolid } from "../../test-helpers/mount-solid.ts";
 import { mountSolid as mountSolidComponent } from "../../test-helpers/solid-render.tsx";
-import { flush } from "../../test-helpers/solid-settle.ts";
-import { createComposerContainer } from "./chat-composer.test-support.ts";
-import { resetChatViewState } from "./chat-view-state.ts";
+import { flush, waitForSolid } from "../../test-helpers/solid-settle.ts";
+import { composerContextWrapper, createComposerContainer } from "./chat-composer.test-support.ts";
+import { resetChatViewState } from "./chat-view-state.test-support.ts";
 import { ChatView, type ChatProps } from "./chat-view.tsx";
+import { createComposerQuestions } from "./components/chat-composer-questions.ts";
 import { registerMessageActionElements } from "./components/chat-message-action-elements.ts";
 import {
   prepareChatMessageRender,
@@ -30,11 +31,17 @@ import {
 type ChatModelControlsProps = Parameters<typeof ChatModelControls>[0];
 const modelControlsUpdates = new WeakMap<HTMLElement, (props: ChatModelControlsProps) => void>();
 
-export function renderChatModelControls(props: ChatModelControlsProps, container: HTMLDivElement) {
+export async function renderChatModelControls(
+  props: ChatModelControlsProps,
+  container: HTMLDivElement,
+) {
   const renderProps: ChatModelControlsProps = {
     ...props,
     modelPickerOpen: props.modelPickerOpen ?? true,
   };
+  if (renderProps.modelPickerOpen) {
+    await import("./components/chat-model-picker-panel.tsx");
+  }
   const update = modelControlsUpdates.get(container);
   if (update) {
     update(renderProps);
@@ -45,6 +52,13 @@ export function renderChatModelControls(props: ChatModelControlsProps, container
     }
     const view = mountSolidComponent(ChatModelControls, renderProps, container);
     modelControlsUpdates.set(container, (next) => view.update(next));
+  }
+  if (renderProps.modelPickerOpen) {
+    // The first open compiles the lazy panel under the full CI shard's load.
+    await waitForSolid(
+      () => expect(container.querySelector(".chat-controls__model-menu")).not.toBeNull(),
+      { timeout: 5_000 },
+    );
   }
   return container;
 }
@@ -264,8 +278,10 @@ export function renderChatPropsInto(
     }
     const [current, setCurrent] = createSignal({ props, application });
     const view = mountSolid(
-      () =>
-        createComponent(ChatView, {
+      () => {
+        const questions = createComposerQuestions(props.paneId, () => current().props);
+        return createComponent(ChatView, {
+          questions,
           get props() {
             return current().props;
           },
@@ -273,8 +289,9 @@ export function renderChatPropsInto(
             const value = current().application;
             return value && normalizeApplicationContext(value);
           },
-        }),
-      { container },
+        });
+      },
+      { container, wrapper: composerContextWrapper(container) },
     );
     mountedViews.set(container, {
       update: (nextProps, nextApplication) =>

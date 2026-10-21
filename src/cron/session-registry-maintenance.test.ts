@@ -8,6 +8,12 @@ import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import { loadSessionEntry, replaceSessionEntry } from "../config/sessions/session-accessor.js";
 import { resolveSqliteTargetFromSessionStorePath } from "../config/sessions/session-sqlite-target.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import {
+  createAgentDatabaseInspectionRefusal,
+  preparePendingAgentDatabase,
+  recordAgentDatabaseAdmissions,
+  type AgentDatabaseAdmissionRefusal,
+} from "../state/agent-database-admission.js";
 import { reconstructAgentDeletionJournal } from "../state/agent-deletion-journal-recovery.js";
 import { completeAgentDeletionJournalInDatabase } from "../state/agent-deletion-journal.js";
 import {
@@ -112,6 +118,80 @@ describe("runSessionRegistryMaintenance", () => {
     }),
   );
 
+  it.each([
+    "agent-database-inspection-pending",
+    "agent-database-inspection-failed",
+    "agent-database-ownership-mismatch",
+  ] as const)(
+    "defers registry pruning while another agent has %s",
+    withMaintenanceState(async (code: AgentDatabaseAdmissionRefusal["code"]) => {
+      const now = Date.now();
+      vi.spyOn(Date, "now").mockReturnValue(now);
+      const config: OpenClawConfig = {
+        agents: { ownership: "explicit", entries: { slow: {}, healthy: {} } },
+      };
+      await state.writeConfig(config);
+      setRuntimeConfigSnapshot(config);
+      const slow = await writeStaleCronSession("slow");
+      const healthy = await writeStaleCronSession("healthy");
+      const child = { storePath: slow.storePath, sessionKey: "agent:slow:dashboard:child" };
+      const childEntry = {
+        sessionId: "cross-agent-child",
+        updatedAt: now,
+        spawnedBy: healthy.sessionKey,
+      };
+      await replaceSessionEntry(child, childEntry);
+      const inspection = createAgentDatabaseInspectionRefusal({
+        agentId: "slow",
+        paths: [resolveSqliteTargetFromSessionStorePath(slow.storePath).path],
+        pending: code === "agent-database-inspection-pending",
+        reason: "Database is unavailable",
+      });
+      const refusal: AgentDatabaseAdmissionRefusal =
+        code === "agent-database-ownership-mismatch"
+          ? { ...inspection, code, embeddedOwnerId: "other-owner" }
+          : inspection;
+      recordAgentDatabaseAdmissions([refusal]);
+      const params = { apply: true, cronStorePath: state.statePath("cron/jobs.json") };
+
+      const waiting = await runSessionRegistryMaintenance(params);
+
+      expect(waiting).toMatchObject({
+        pruned: 0,
+        skippedStores: 1,
+        nextSweepAtMs: now + 60_000,
+        skippedReason: "session child inventory incomplete",
+        stores: expect.arrayContaining([
+          {
+            agentId: "slow",
+            storePath: refusal.paths[0],
+            skippedReason: code,
+          },
+        ]),
+      });
+      expect(loadSessionEntry(healthy)).toBeDefined();
+      if (code !== "agent-database-inspection-pending") {
+        return;
+      }
+      await preparePendingAgentDatabase(refusal, { assertCurrent() {} }, async () => {
+        expect(loadSessionEntry(slow)).toBeDefined();
+      });
+
+      const resumed = await runSessionRegistryMaintenance(params);
+
+      expect(resumed).toMatchObject({ pruned: 1, skippedStores: 0 });
+      expect(loadSessionEntry(slow)).toBeUndefined();
+      expect(loadSessionEntry(healthy)).toBeDefined();
+      await replaceSessionEntry(child, { ...childEntry, archivedAt: now });
+
+      expect(await runSessionRegistryMaintenance(params)).toMatchObject({
+        pruned: 1,
+        skippedStores: 0,
+      });
+      expect(loadSessionEntry(healthy)).toBeUndefined();
+    }),
+  );
+
   it.each(["per-agent", "fixed selector", "exact database"])(
     "prunes every configured agent's stale cron rows with a %s store",
     withMaintenanceState(async (kind: string) => {
@@ -195,7 +275,7 @@ describe("runSessionRegistryMaintenance", () => {
   );
 
   it.each(["missing", "reconstructed"])(
-    "preserves stores held by %s deletion history while continuing eligible retention",
+    "defers registry pruning while stores are held by %s deletion history",
     withMaintenanceState(async (history: string) => {
       const main = await writeStaleCronSession("main");
       const retained = await writeStaleCronSession("retained");
@@ -215,8 +295,9 @@ describe("runSessionRegistryMaintenance", () => {
       });
 
       expect(summary).toMatchObject({
-        pruned: history === "missing" ? 0 : 1,
+        pruned: 0,
         skippedStores: history === "missing" ? 2 : 1,
+        skippedReason: "session child inventory incomplete",
       });
       expect(summary.stores).toContainEqual({
         agentId: "retained",
@@ -228,7 +309,7 @@ describe("runSessionRegistryMaintenance", () => {
       expect(held).toMatchObject({ warning: expect.stringContaining("openclaw doctor --fix") });
       expect(await fs.readFile(databasePath)).toEqual(bytes);
       expect(loadSessionEntry(retained)).toBeDefined();
-      expect(loadSessionEntry(main) !== undefined).toBe(history === "missing");
+      expect(loadSessionEntry(main)).toBeDefined();
     }),
   );
 

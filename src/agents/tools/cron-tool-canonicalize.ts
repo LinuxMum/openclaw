@@ -16,6 +16,8 @@ const CRON_FLAT_PAYLOAD_KEYS = [
   "timeoutSeconds",
   "toolBudget",
   "lightContext",
+  "includeReasoning",
+  "skipIfScratchEmpty",
   "allowUnsafeExternalContent",
 ] as const;
 const CRON_FLAT_SCHEDULE_KEYS = [
@@ -47,6 +49,8 @@ const CRON_RECOVERABLE_OBJECT_KEYS: ReadonlySet<string> = new Set([
   "owner",
   "schedule",
   "pacing",
+  "activeHours",
+  "idleOnly",
   "trigger",
   "sessionTarget",
   "wakeMode",
@@ -68,10 +72,13 @@ const CRON_RECOVERABLE_OBJECT_KEYS: ReadonlySet<string> = new Set([
 // Only object-valued CronJobSchema fields accept dotted paths; scalar names
 // such as "nightly.report" must not become nested objects.
 const CRON_NESTABLE_OBJECT_KEYS: ReadonlySet<string> = new Set([
+  "activeHours",
   "delivery",
   "failureAlert",
   "owner",
   "pacing",
+  "activeHours",
+  "idleOnly",
   "payload",
   "schedule",
   "trigger",
@@ -149,6 +156,16 @@ function setScheduleAtMs(schedule: Record<string, unknown>, value: unknown): voi
 function canonicalizeCronToolSchedule(value: Record<string, unknown>): void {
   const schedule = isRecord(value.schedule) ? { ...value.schedule } : {};
 
+  if (
+    (schedule.command !== undefined || value.command !== undefined) &&
+    !isCronScheduleKind(schedule.kind) &&
+    !isCronScheduleKind(value.kind)
+  ) {
+    throw new Error(
+      'A command schedule needs an explicit schedule.kind. Read the full automations schema and WATCH OUTPUT example before retrying. For a stream, use kind:"stream" and command as an argv array.',
+    );
+  }
+
   if (schedule.atMs !== undefined) {
     setScheduleAtMs(schedule, schedule.atMs);
     delete schedule.atMs;
@@ -185,7 +202,6 @@ function canonicalizeCronToolSchedule(value: Record<string, unknown>): void {
   for (const [kind, target, sources] of [
     ["every", "everyMs", ["everyMs", "every"]],
     ["cron", "expr", ["cron", "expr"]],
-    ["on-exit", "command", ["command"]],
   ] as const) {
     // Consume only the first alias; conflicting fields remain for Gateway validation.
     const moved = sources.some((source) => moveDefinedField(value, schedule, source, target));
@@ -193,6 +209,8 @@ function canonicalizeCronToolSchedule(value: Record<string, unknown>): void {
       schedule.kind = kind;
     }
   }
+
+  moveDefinedField(value, schedule, "command");
 
   for (const key of [
     "anchorMs",
@@ -222,8 +240,6 @@ function canonicalizeCronToolSchedule(value: Record<string, unknown>): void {
       schedule.kind = "every";
     } else if (schedule.expr !== undefined) {
       schedule.kind = "cron";
-    } else if (schedule.command !== undefined) {
-      schedule.kind = "on-exit";
     }
   }
 
@@ -259,6 +275,8 @@ function canonicalizeCronToolPayload(
         isNonEmptyString(payload.thinking) ||
         (typeof payload.timeoutSeconds === "number" && isNonEmptyString(payload.text)) ||
         typeof payload.lightContext === "boolean" ||
+        typeof payload.includeReasoning === "boolean" ||
+        typeof payload.skipIfScratchEmpty === "boolean" ||
         typeof payload.allowUnsafeExternalContent === "boolean" ||
         (payload.fallbacks !== undefined && isStringArrayOrNull(payload.fallbacks));
       if (hasAgentTurnSignal) {

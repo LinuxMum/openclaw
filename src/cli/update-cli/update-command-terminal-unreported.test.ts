@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, assert, beforeEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { prepareUpdateFailureReport } from "../../infra/update-failure-report-prepare.js";
 import {
@@ -11,18 +12,21 @@ import {
 } from "../../infra/update-run-ledger.js";
 import { defaultRuntime } from "../../runtime.js";
 import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
-import { resolveOpenClawStateSqliteDir } from "../../state/openclaw-state-db.paths.js";
+import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
 import { expectMessages, expectNoCalls } from "./update-boundary.test-support.js";
+import { reportUnreportedUpdateAdmissionOutcome } from "./update-command-admission-report.js";
+import { snapshotUpdateFixtureTree } from "./update-command-filesystem-snapshot.test-support.js";
 import { UpdateCommandRecoveryPendingError } from "./update-command-recovery-error.js";
 import {
+  UnreportedUpdateAdmissionOutcome,
   UpdateCommandFailure,
   UpdateCommandPendingRecoveryFailure,
 } from "./update-command-result.js";
 import {
   deferUpdateCommandTerminalResult,
-  publishUpdateCommandTerminalResult,
   withUpdateCommandTerminalResult,
 } from "./update-command-terminal.js";
+import { publishUpdateCommandTerminalResultForTest as publishUpdateCommandTerminalResult } from "./update-command-terminal.test-support.js";
 import { withUpdateFailureTriage } from "./update-command-triage.js";
 
 const mocks = vi.hoisted(() => ({
@@ -80,6 +84,68 @@ afterEach(() => {
   closeOpenClawStateDatabaseForTest();
   vi.restoreAllMocks();
 });
+
+it.each([
+  { status: "skipped", capturedBefore: false },
+  { status: "error", capturedBefore: true },
+] as const)(
+  "does not borrow a nested Run for a detached $status refusal (captured before: $capturedBefore)",
+  async ({ status, capturedBefore }) => {
+    const env = { OPENCLAW_STATE_DIR: dirs.make("update-detached-admission-") };
+    const recorded = createUpdateRun({ trigger: "cli" }, { env });
+    const run = { runId: recorded.runId, env };
+    closeOpenClawStateDatabaseForTest();
+    const before = snapshotUpdateFixtureTree(env.OPENCLAW_STATE_DIR);
+    const detachedRoot = dirs.make("update-detached-report-");
+    vi.spyOn(os, "tmpdir").mockReturnValue(detachedRoot);
+    const output = vi.spyOn(defaultRuntime, "writeJson").mockImplementation(() => {});
+    const refusal = new UnreportedUpdateAdmissionOutcome(
+      {
+        root: env.OPENCLAW_STATE_DIR,
+        ...(capturedBefore ? { before: { version: null } } : {}),
+        installKind: "package",
+        reason: "fixture-admission-refused",
+        message: "captured refusal after the original owner settled",
+        opts: { json: true, run },
+        controlPlaneUpdateSentinelMeta: { runId: run.runId, note: "must remain unpublished" },
+      },
+      status === "skipped" ? { exitCode: 0 } : undefined,
+    );
+
+    await expect(
+      reportUnreportedUpdateAdmissionOutcome(refusal, { detached: true }),
+    ).rejects.toMatchObject({ code: status === "skipped" ? 0 : 1 });
+
+    expect(output).toHaveBeenCalledOnce();
+    const result = output.mock.calls[0]?.[0] as {
+      status: string;
+      reason: string;
+      reportPath?: string;
+      before?: unknown;
+      runId?: string;
+    };
+    expect(result).toMatchObject({ status, reason: "fixture-admission-refused" });
+    if (status === "error") {
+      expect(result).toMatchObject({
+        failedStep: {
+          failureFacts: expect.arrayContaining([
+            expect.objectContaining({ code: "fixture-admission-refused" }),
+            { check: "update", code: "update-failed" },
+          ]),
+        },
+      });
+    }
+    expect(result.runId).toBeUndefined();
+    expect(result.before).toEqual(capturedBefore ? { version: null } : undefined);
+    assert(
+      typeof result.reportPath === "string" &&
+        result.reportPath.startsWith(detachedRoot + path.sep),
+    );
+    expect(await fs.readFile(result.reportPath, "utf8")).toContain("fixture-admission-refused");
+    expect(snapshotUpdateFixtureTree(env.OPENCLAW_STATE_DIR)).toEqual(before);
+    expect(getUpdateRun(run.runId, { env })).toEqual(recorded);
+  },
+);
 
 it.each(["new-error", "pending-aggregate"] as const)(
   "preserves primary failure after %s publication",
@@ -226,7 +292,9 @@ it.each(["lost-authority", "pending-publication", "completed-publication"] as co
     const { env, run, read, fails, onResult } = fixture;
     let { recorded } = fixture;
     if (condition === "pending-publication") {
-      await fs.mkdir(path.join(resolveOpenClawStateSqliteDir(env), ".openclaw-restore-fixture"));
+      await fs.mkdir(
+        path.join(path.dirname(resolveOpenClawStateSqlitePath(env)), ".openclaw-restore-fixture"),
+      );
     }
     const failure =
       condition === "lost-authority"

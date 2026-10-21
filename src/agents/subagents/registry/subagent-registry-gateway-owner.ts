@@ -7,6 +7,7 @@ import {
   getAgentEventLifecycleGeneration,
   isAgentEventLifecycleGenerationCurrent,
 } from "../../../infra/agent-events.js";
+import { GatewayOperatorRecoveryAuthorizationError } from "../../../infra/restart-recovery-errors.js";
 import { isSystemEventStoreCurrent } from "../../../infra/system-event-ownership.js";
 import { createSubsystemLogger } from "../../../logging/subsystem.js";
 import {
@@ -16,11 +17,7 @@ import {
 } from "../../../plugins/runtime/gateway-request-scope.js";
 import { captureOpenClawStateWorkerContext } from "../../../state/openclaw-state-worker-context.js";
 import { readRestartRecoveryRequesterSource } from "../../requester-run-recovery-source.js";
-import {
-  getCurrentSubagentRunOwner,
-  getSubagentActivationRuns,
-  subagentRuns,
-} from "./subagent-registry-memory.js";
+import { getCurrentSubagentRunOwner, subagentRuns } from "./subagent-registry-memory.js";
 import {
   mutateSubagentRuns,
   assertSubagentRegistryWriteSourceCurrent,
@@ -318,7 +315,10 @@ async function restoreSubagentCompletionSource(
       deferredCompletionSources.add(runtimeKey);
       return;
     }
-    if (error instanceof GatewayOperatorAccessDeniedError) {
+    if (
+      error instanceof GatewayOperatorAccessDeniedError ||
+      error instanceof GatewayOperatorRecoveryAuthorizationError
+    ) {
       unrestorableCompletionSources.set(
         runtimeKey,
         "The original operator no longer has access to this requester continuation",
@@ -409,6 +409,7 @@ async function recoverSubagentRunGatewayOwner(
 /** Activate unfinished obligations; the registry owns later retention of cold rows. */
 export async function bindSubagentRunGatewayOwners(params: {
   runs: Map<string, SubagentRunRecord>;
+  entries: readonly SubagentRunRecord[];
   resumedRuns: Set<object>;
   getGatewayContextResolver: () => GatewayContextResolver | undefined;
   onRecovered: (entry: SubagentRunRecord) => void;
@@ -421,7 +422,7 @@ export async function bindSubagentRunGatewayOwners(params: {
   }
   const isCurrent = () => params.getGatewayContextResolver() === resolver && resolver() === gateway;
   bindGatewayContextResolver(params.runs, resolver);
-  const capturedRuns = [...getSubagentActivationRuns(params.runs)];
+  const capturedRuns = params.entries;
   const metrics: ActivationMetrics = {
     authorityRestoreMs: 0,
     publishMs: 0,

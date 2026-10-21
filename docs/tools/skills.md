@@ -233,7 +233,6 @@ regardless of where they are loaded from.
     ownership: "explicit",
     defaults: {
       skills: ["github", "weather"], // shared baseline
-      heartbeat: { agentId: "writer" },
       systemAgent: { agentId: "writer" },
       authInheritance: { agentId: "writer" },
     },
@@ -798,6 +797,8 @@ OpenClaw actions and Gateway startup still refresh skills immediately.
   <Accordion title="Automatic skill refresh">
     The background discovery worker scans configured skill roots, so ordinary
     source edits elsewhere in a workspace do not trigger skill rescans.
+    Missing skill roots observe their nearest existing ancestor; unrelated
+    sibling writes and ancestor metadata changes do not trigger discovery.
     Configure under `skills.load`:
 
     ```json5
@@ -812,7 +813,7 @@ OpenClaw actions and Gateway startup still refresh skills immediately.
     }
     ```
 
-    Passive edits are coalesced into the next periodic scan. Supporting-file
+    Native file events are coalesced into a discovery pass. Supporting-file
     changes refresh sandbox copies without changing the skill catalog. Unchanged
     names, configuration keys, sources, precedence winners, and `SKILL.md` content
     keep the same snapshot version and do not notify chat metadata consumers.

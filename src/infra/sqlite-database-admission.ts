@@ -29,6 +29,7 @@ import {
   type Admission,
   type AdmissionFactValue,
   type SqliteDatabaseAdmissionKey,
+  type SqliteDatabaseFactKey,
   type StagedAdmissionFact,
 } from "./sqlite-database-admission-record.js";
 import {
@@ -37,7 +38,7 @@ import {
 } from "./sqlite-database-admission-seal.js";
 import { createSqliteDatabaseWriteReceipts } from "./sqlite-database-write-receipts.js";
 import { getSqliteNativeAdmissionFacts } from "./sqlite-native-admission.js";
-import { stageSqliteTransactionState } from "./sqlite-post-commit.js";
+import { hasSqlitePostCommitScope, stageSqliteTransactionState } from "./sqlite-post-commit.js";
 
 export {
   readSqliteDatabaseAdmissions,
@@ -47,6 +48,7 @@ export {
 export type {
   SqliteDatabaseAdmissions,
   SqliteDatabaseAdmissionKey,
+  SqliteDatabaseFactKey,
 } from "./sqlite-database-admission-record.js";
 export { beginSqliteDatabaseAdmissionOperation } from "./sqlite-native-admission.js";
 
@@ -64,6 +66,7 @@ const seals = resolveGlobalSingleton(
     new SqliteDatabaseCleanCloseSeals(publishFact, {
       retain: (record) => state.registry.changeReferences(record, 1),
       release: releaseReference,
+      publish: (record) => state.registry.publish(record),
     }),
 );
 
@@ -96,6 +99,11 @@ export function readSqliteDatabaseIntegrityVerification(
   return verifiedAt === undefined ? undefined : { verifiedAt };
 }
 
+/** Consume the admission owner's first-load diagnostic, including in worker isolates. */
+export function readSqliteDatabaseCleanCloseRefusal(database: EngineConnection) {
+  return admission(sqlPublicationAnchor(database))?.cleanCloseRefusal;
+}
+
 export function recordSqliteDatabaseIntegrity(db: DatabaseSync, verifiedAt = Date.now()): void {
   publishSqliteDatabaseAdmission(db, integrityVerificationKey, verifiedAt);
 }
@@ -122,6 +130,7 @@ export const {
   getSqliteDatabaseAdmission,
   getSqliteDatabaseSchemaRevision,
   getOrLoadSqliteDatabaseAdmissionForPath,
+  peekSqliteDatabaseAdmissionForPath,
   hasSqliteDatabaseSchemaAdmissionForPath,
   getSqliteDatabaseAdmissionIdentityForPath,
   hasSqliteDatabaseSchemaAdmissionForIdentity,
@@ -544,7 +553,7 @@ export function hasPendingSqliteDatabaseSchemaMutation(
 
 export function publishSqliteDatabaseAdmission<T>(
   database: DatabaseSync | PostgresSqlConnection,
-  key: SqliteDatabaseAdmissionKey<T>,
+  key: SqliteDatabaseFactKey<T>,
   value: T,
   options: { schemaRevision?: number } = {},
 ): void {
@@ -563,7 +572,7 @@ export function publishSqliteDatabaseAdmission<T>(
     ? undefined
     : getSqliteNativeAdmissionFacts(database);
   const admitted = admitSqliteDatabaseFactValue(key, value);
-  if (!native && !database.isTransaction) {
+  if (!native && !database.isTransaction && !hasSqlitePostCommitScope(database)) {
     publishFact(record, key, admitted, revision);
     return;
   }

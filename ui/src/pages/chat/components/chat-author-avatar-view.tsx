@@ -19,10 +19,12 @@ import {
 } from "../../../lib/identity-avatar.ts";
 
 export type ChatAuthorAvatarProps = {
+  elementRef?: (element: HTMLElement) => void;
   sender: IdentityAvatarInput | null | undefined;
   class?: string;
   agentAvatar?: { avatar?: string | null; textAvatar?: string | null };
   channelAvatar?: ChannelSenderAvatarSource;
+  hideTooltip?: boolean;
 };
 
 function InitialsAvatar(props: {
@@ -43,7 +45,7 @@ function InitialsAvatar(props: {
 /** Small author marker shared by transcript bubbles and the pending-send queue. */
 export function ChatAuthorAvatar(props: ChatAuthorAvatarProps) {
   const gateway = useAvatarGatewayContext();
-  const label = createMemo(() => formatSenderLabel(props.sender));
+  const label = () => formatSenderLabel(props.sender);
   const avatar = createMemo(() => {
     gateway();
     const value = props.sender ? resolveAvatar(props.sender) : undefined;
@@ -58,20 +60,23 @@ export function ChatAuthorAvatar(props: ChatAuthorAvatarProps) {
             <IdentityAvatar identity={sender()}>
               {(view) => (
                 <ProfileAuthorAvatar
+                  elementRef={props.elementRef}
                   view={view()}
                   sender={sender()}
                   label={label()!}
                   channelAvatar={props.channelAvatar}
+                  hideTooltip={props.hideTooltip}
                 />
               )}
             </IdentityAvatar>
           }
         >
           <span
+            ref={(element) => props.elementRef?.(element)}
             class={props.class ?? "chat-author-avatar"}
             role="img"
             aria-label={label()!}
-            title={label()!}
+            title={props.hideTooltip ? undefined : label()!}
           >
             <AgentIdentityAvatar
               agent={{
@@ -88,10 +93,12 @@ export function ChatAuthorAvatar(props: ChatAuthorAvatarProps) {
 }
 
 function ProfileAuthorAvatar(props: {
+  elementRef?: (element: HTMLElement) => void;
   view: IdentityAvatarView;
   sender: IdentityAvatarInput;
   label: string;
   channelAvatar?: ChannelSenderAvatarSource;
+  hideTooltip?: boolean;
 }) {
   const gateway = useAvatarGatewayContext();
   const channelPhoto = createMemo(() =>
@@ -100,11 +107,12 @@ function ProfileAuthorAvatar(props: {
   const presentation = createIdentityAvatarPresentation(() => props.view);
   return (
     <span
+      ref={(element) => props.elementRef?.(element)}
       data-avatar-state={channelPhoto() ? undefined : presentation.state()}
       class={["chat-author-avatar", channelPhoto() ? undefined : presentation.classes()]}
       role="img"
       aria-label={props.label}
-      title={props.label}
+      title={props.hideTooltip ? undefined : props.label}
     >
       <Show
         when={channelPhoto()}
@@ -135,11 +143,16 @@ function ProfileAuthorAvatar(props: {
 }
 
 /** Image failure reveals the same initials without replacing the avatar frame. */
-export function UserAvatarSlot(props: { view: IdentityAvatarView; label: string }) {
+export function UserAvatarSlot(props: {
+  view: IdentityAvatarView;
+  label: string;
+  elementRef?: (element: HTMLElement) => void;
+}) {
   const presentation = createIdentityAvatarPresentation(() => props.view);
   return (
     <Show when={Boolean(props.view.imageUrl)} fallback={<UserInitials {...props} />}>
       <span
+        ref={(element) => props.elementRef?.(element)}
         data-avatar-state={presentation.state()}
         class={["chat-avatar-slot", presentation.classes()]}
       >
@@ -149,15 +162,20 @@ export function UserAvatarSlot(props: { view: IdentityAvatarView; label: string 
           class="chat-avatar user"
           alt={props.label}
         />
-        <UserInitials {...props} />
+        <UserInitials view={props.view} label={props.label} />
       </span>
     </Show>
   );
 }
 
-function UserInitials(props: { view: IdentityAvatarView; label: string }) {
+function UserInitials(props: {
+  view: IdentityAvatarView;
+  label: string;
+  elementRef?: (element: HTMLElement) => void;
+}) {
   return (
     <div
+      ref={(element) => props.elementRef?.(element)}
       class="chat-avatar user chat-avatar--sender-initials"
       style={{ background: `hsl(${props.view.fallback.colorSeed % 360} 48% 42%)` }}
       role="img"

@@ -102,13 +102,21 @@ export function invalidateChatMetadataStore(
   commandsChanged = true,
 ): void {
   // Catalog readers share this lifecycle; retire their copies before metadata listeners reload.
+  let matchesCatalog: ChatMetadataInvalidation["matchesCatalog"];
   if (catalogInvalidation === "clear") {
     clearModelCatalogCache(client, { requireSnapshot: true });
+  } else if (catalogInvalidation === "pending") {
+    matchesCatalog = invalidateModelCatalogCache(
+      client,
+      { ...scope, pendingOnly: true },
+      sessionDefaults,
+    );
   } else if (catalogInvalidation === "refresh") {
     invalidateModelCatalogCache(client, scope, sessionDefaults);
   }
   chatMetadataCache.get(client)?.invalidate(scope, sessionDefaults, {
     commandsChanged,
+    matchesCatalog: commandsChanged ? undefined : matchesCatalog,
     retireCatalog: catalogInvalidation === "clear",
   });
 }
@@ -125,7 +133,6 @@ export function invalidateChatMetadataForSessionEvent(
   const agentId = typeof agent === "string" ? agent : undefined;
   const scope = changed ? { agentId, sessionKey: changed.key } : undefined;
   const sessionModelRevision =
-    source?.catalogChanged !== true &&
     source?.phase !== "reset" &&
     source?.reason !== "reset" &&
     source?.reason !== "delete" &&
